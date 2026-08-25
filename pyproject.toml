@@ -1,0 +1,13 @@
+[project]
+name = "agents-owl"
+version = "0.1.0"
+description = "Optional terminal-first worker/peer collaboration for repository agents"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
