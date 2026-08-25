@@ -28,3 +28,19 @@ Alchemist 是 AgentsOwl 从 Research Gate v0 迁出的起点，但 AgentsOwl 不
 
 Alchemist 根目录的 `.agents-owl.json` 只列出权威文件，不复制规则，避免
 工具仓库与项目仓库形成两份会漂移的事实源。
+
+## 当前 shell 入口
+
+新 shell（或 `source ~/.bashrc`）中：
+
+```text
+pair       列出全部 Alchemist 会话，编号选择后 resume/inspect/finish 等
+rgimpl     新建 Claude worker；交互输入本次 topic
+rgreview   新建 Codex advisory peer；输入与 worker 完全相同的 topic 即自动关联
+rgi        只列 worker 会话并进入编号选择
+rgr        只列 peer 会话并进入编号选择
+```
+
+一个 topic 完成后在 `pair` 中选择 `finish`，后续主题使用 `rgimpl` 新建会话。
+需要直接命令操作时，session selector 可使用原生 ID、唯一名称或
+`provider:native_session_id`。

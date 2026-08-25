@@ -2,8 +2,9 @@
 
 ## 定位
 
-AgentsOwl 只解决三件事：保持两个独立 agent 会话、传递有结构的交接材料、
-保留本地证据链。它不定义项目方法论，也不建立第二套审批或状态系统。
+AgentsOwl 的可选双 AI 层只解决三件事：保持两个独立 agent 会话、传递有
+结构的交接材料、保留本地证据链。基础会话索引见 `SESSIONS.md`。两者都不
+定义项目方法论，也不建立第二套审批或状态系统。
 
 ```text
 human task → worker → verified deliverable
@@ -77,13 +78,15 @@ Peer 不拥有 veto。它不能冻结路线、批准发布、扩大任务，或�
 
 ## tmux 与并发
 
-默认 session 名为：
+v0.1 兼容 pair session 名为：
 
 ```text
 owl-<pair>-worker
 owl-<pair>-peer
 ```
 
-`session` 在会话不存在时创建，存在时直接 attach。用 `Ctrl-b d` detach。
+兼容命令 `session PAIR ROLE` 在会话不存在时创建，存在时直接 attach。用
+`Ctrl-b d` detach。新任务推荐使用 `session new`，其 tmux 名包含 repo、topic、
+role 和稳定 hash，原生 session ID 才是身份。
 向 agent 注入 prompt 前，`send-peer`/`send-back` 会先验证 tmux target；可用
 `--target session:window.pane` 显式指定 pane。

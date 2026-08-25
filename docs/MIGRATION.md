@@ -27,20 +27,22 @@ review/reviewer      → peer
 
 ## Shell alias 迁移
 
-旧别名可以保留名称，只替换实现：
+五个旧别名可以保留名称，并切换为原生 session 列表/选择器：
 
 ```bash
 AGENTS_OWL_BIN="$HOME/workspace/agentsOwl/bin/agents-owl"
 PROJECT_REPO="$HOME/workspace/example"
 
-alias rgimpl="cd $PROJECT_REPO && AGENTS_OWL_REPO=$PROJECT_REPO $AGENTS_OWL_BIN session example worker"
-alias rgreview="cd $PROJECT_REPO && AGENTS_OWL_REPO=$PROJECT_REPO $AGENTS_OWL_BIN session example peer"
-alias pair="cd $PROJECT_REPO && AGENTS_OWL_REPO=$PROJECT_REPO $AGENTS_OWL_BIN"
-alias rgi='tmux attach-session -t owl-example-worker'
-alias rgr='tmux attach-session -t owl-example-peer'
+alias rgimpl="cd $PROJECT_REPO && $AGENTS_OWL_BIN session new --provider claude --role worker"
+alias rgreview="cd $PROJECT_REPO && $AGENTS_OWL_BIN session new --provider codex --role peer"
+alias pair="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions"
+alias rgi="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role worker"
+alias rgr="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role peer"
 ```
 
-在 shell alias 中不要依赖未展开的临时变量；生产配置宜使用完整路径。
+实际 `.bashrc` 中应把 `$PROJECT_REPO` 和 `$AGENTS_OWL_BIN` 展开成完整路径，
+避免 alias 执行时变量不存在。v0.1 的 `session PAIR ROLE` 仍兼容，但只用于
+旧固定 pair tmux，不进入新的原生 session index。
 
 ## 旧数据
 

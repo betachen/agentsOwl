@@ -17,6 +17,18 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+from .providers import ProviderError
+from .registry import RegistryError, SessionRecord
+from .session_manager import (
+    SessionManager,
+    SessionManagerError,
+    attach_tmux,
+    handle_claude_hook,
+    install_claude_hooks,
+    make_tmux_name,
+    runtime_lifecycle,
+)
+
 
 PAIR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 ROLE_ALIASES = {
@@ -425,6 +437,219 @@ def command_show_latest(args: argparse.Namespace) -> None:
     print(path.read_text(encoding="utf-8"), end="")
 
 
+def session_manager(args: argparse.Namespace) -> SessionManager:
+    repo, state_home = context(args)
+    return SessionManager(repo, state_home)
+
+
+def record_value(record: SessionRecord) -> dict[str, Any]:
+    value = record.to_dict()
+    value["key"] = record.key
+    value["runtime_lifecycle"] = runtime_lifecycle(record)
+    return value
+
+
+def print_session_table(records: list[SessionRecord]) -> None:
+    if not records:
+        print("no managed sessions")
+        return
+    print(f"{'#':>3}  {'state':<10} {'provider':<7} {'role':<6} {'topic':<28} name")
+    for index, record in enumerate(records, 1):
+        topic = record.topic if len(record.topic) <= 28 else f"{record.topic[:27]}…"
+        print(
+            f"{index:>3}  {runtime_lifecycle(record):<10} {record.provider:<7} "
+            f"{record.role:<6} {topic:<28} {record.native_name}"
+        )
+
+
+def choose_record(
+    records: list[SessionRecord], prompt: str = "Select session", *, show_table: bool = True
+) -> SessionRecord:
+    if not records:
+        raise SessionManagerError("no matching managed sessions")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise SessionManagerError("a session selector is required outside an interactive terminal")
+    if show_table:
+        print_session_table(records)
+    choice = input(f"{prompt} [1-{len(records)}, q]: ").strip()
+    if choice.lower() == "q":
+        raise SystemExit(0)
+    try:
+        index = int(choice)
+    except ValueError as exc:
+        raise SessionManagerError(f"invalid selection: {choice}") from exc
+    if index < 1 or index > len(records):
+        raise SessionManagerError(f"selection out of range: {index}")
+    return records[index - 1]
+
+
+def resolve_managed_session(
+    manager: SessionManager,
+    selector: str | None,
+    *,
+    include_archived: bool = True,
+) -> SessionRecord:
+    if selector:
+        return manager.registry.resolve(
+            selector,
+            repo=manager.repo,
+            include_archived=include_archived,
+        )
+    records = manager.registry.find(repo=manager.repo, include_archived=include_archived)
+    return choose_record(records)
+
+
+def command_sessions(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    repo_filter = None if args.global_scope else manager.repo
+    records = manager.registry.find(
+        repo=repo_filter,
+        provider=args.provider,
+        role=args.role,
+        include_archived=args.all,
+    )
+    if args.json:
+        print(json.dumps([record_value(record) for record in records], ensure_ascii=False, indent=2))
+        return
+    print_session_table(records)
+    if args.no_select or not records or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    selected = choose_record(records, prompt="Open", show_table=False)
+    state = runtime_lifecycle(selected)
+    actions = ["attach"] if state == "running" else []
+    if selected.lifecycle == "archived":
+        actions.extend(["unarchive", "inspect"])
+    else:
+        actions.extend(["resume", "inspect", "finish", "rename", "archive"])
+    actions = list(dict.fromkeys(actions))
+    print("  ".join(f"{index}. {action}" for index, action in enumerate(actions, 1)))
+    choice = input("Action [number, q]: ").strip()
+    if choice.lower() == "q":
+        return
+    try:
+        action_index = int(choice)
+    except ValueError as exc:
+        raise SessionManagerError(f"invalid action: {choice}") from exc
+    if action_index < 1 or action_index > len(actions):
+        raise SessionManagerError(f"invalid action: {choice}")
+    action = actions[action_index - 1]
+    if action == "attach":
+        if not selected.tmux_session:
+            raise SessionManagerError("session has no tmux runtime")
+        attach_tmux(selected.tmux_session)
+    if action == "resume":
+        resumed = manager.resume(selected)
+        if not resumed.tmux_session:
+            raise SessionManagerError("session has no tmux runtime")
+        attach_tmux(resumed.tmux_session)
+    if action == "inspect":
+        print(json.dumps(record_value(selected), ensure_ascii=False, indent=2))
+    if action == "finish":
+        outcome = input("Outcome (optional): ").strip()
+        manager.finish(selected, outcome=outcome)
+        print(f"completed {selected.key}")
+    if action == "rename":
+        name = input("New native name: ").strip()
+        renamed = manager.rename(selected, name)
+        print(f"renamed {renamed.key} -> {renamed.native_name}")
+    if action == "archive":
+        archived = manager.archive(selected)
+        print(f"archived {archived.key}")
+    if action == "unarchive":
+        restored = manager.unarchive(selected)
+        print(f"unarchived {restored.key}")
+
+
+def required_or_prompt(value: str | None, label: str) -> str:
+    if value:
+        return value
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        result = input(f"{label}: ").strip()
+        if result:
+            return result
+    raise SessionManagerError(f"{label.lower()} is required")
+
+
+def command_session_new(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    provider = required_or_prompt(args.provider, "Provider (codex/claude)")
+    topic = required_or_prompt(args.topic, "Topic")
+    role = required_or_prompt(args.role, "Role (worker/peer)")
+    record = manager.new(provider=provider, topic=topic, role=role, native_name=args.name)
+    if record is None:
+        tmux_name = make_tmux_name(manager.repo, topic, role)
+        print(f"started Claude session in {tmux_name}; native id registration is pending")
+        if not args.no_attach:
+            attach_tmux(tmux_name)
+        return
+    print(f"started {record.key}: {record.native_name}")
+    if not args.no_attach and record.tmux_session:
+        attach_tmux(record.tmux_session)
+
+
+def command_session_resume(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector, include_archived=False)
+    resumed = manager.resume(record)
+    print(f"resumed {resumed.key}")
+    if not args.no_attach and resumed.tmux_session:
+        attach_tmux(resumed.tmux_session)
+
+
+def command_session_finish(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector, include_archived=False)
+    completed = manager.finish(record, outcome=args.outcome, stop=args.stop)
+    print(f"completed {completed.key}")
+
+
+def command_session_rename(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector)
+    renamed = manager.rename(record, args.name)
+    print(f"renamed {renamed.key} -> {renamed.native_name}")
+
+
+def command_session_inspect(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector)
+    value = record_value(record)
+    if args.native and record.provider == "codex":
+        value["native"] = manager.codex.read(record.native_session_id)
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def command_session_archive(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector, include_archived=False)
+    archived = manager.archive(record)
+    qualifier = "native + index" if record.provider == "codex" else "index view"
+    print(f"archived {archived.key} ({qualifier})")
+
+
+def command_session_unarchive(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector)
+    restored = manager.unarchive(record)
+    print(f"unarchived {restored.key}")
+
+
+def command_hook_claude(args: argparse.Namespace) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise SessionManagerError(f"invalid Claude hook payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SessionManagerError("Claude hook payload must be a JSON object")
+    handle_claude_hook(payload, dict(os.environ))
+
+
+def command_hook_install_claude(args: argparse.Namespace) -> None:
+    settings = Path(args.settings).expanduser().resolve()
+    changed = install_claude_hooks(settings, retention_days=args.retention_days)
+    print(f"{'installed' if changed else 'already installed'} Claude session hooks: {settings}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agents-owl",
@@ -442,11 +667,76 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("pair")
     status.set_defaults(func=command_status)
 
-    session = sub.add_parser("session", help="create or attach a worker/peer tmux session")
-    session.add_argument("pair")
-    session.add_argument("role", choices=sorted(ROLE_ALIASES))
-    session.add_argument("--command", help="agent command; defaults to claude for worker and codex for peer")
-    session.set_defaults(func=command_session)
+    sessions = sub.add_parser("sessions", help="list and select native Codex/Claude sessions")
+    sessions.add_argument("--provider", choices=("codex", "claude"))
+    sessions.add_argument("--role", choices=("worker", "peer"))
+    sessions.add_argument("--all", action="store_true", help="include archived sessions")
+    sessions.add_argument("--global", dest="global_scope", action="store_true", help="include all repositories")
+    sessions.add_argument("--json", action="store_true")
+    sessions.add_argument("--no-select", action="store_true", help="only print the list")
+    sessions.set_defaults(func=command_sessions)
+
+    managed_session = sub.add_parser("session", help="manage provider-native sessions")
+    managed_sub = managed_session.add_subparsers(dest="session_action", required=True)
+
+    managed_new = managed_sub.add_parser("new", help="start a named native session")
+    managed_new.add_argument("--provider", choices=("codex", "claude"))
+    managed_new.add_argument("--topic")
+    managed_new.add_argument("--role", choices=("worker", "peer"))
+    managed_new.add_argument("--name", help="provider-native session name")
+    managed_new.add_argument("--no-attach", action="store_true")
+    managed_new.set_defaults(func=command_session_new)
+
+    managed_resume = managed_sub.add_parser("resume", help="resume by native id, name, or index key")
+    managed_resume.add_argument("selector", nargs="?")
+    managed_resume.add_argument("--no-attach", action="store_true")
+    managed_resume.set_defaults(func=command_session_resume)
+
+    managed_finish = managed_sub.add_parser("finish", help="mark a topic session completed")
+    managed_finish.add_argument("selector", nargs="?")
+    managed_finish.add_argument("--outcome", default="")
+    managed_finish.add_argument("--stop", action="store_true", help="also stop its tmux runtime")
+    managed_finish.set_defaults(func=command_session_finish)
+
+    managed_rename = managed_sub.add_parser("rename", help="rename the provider-native session")
+    managed_rename.add_argument("selector")
+    managed_rename.add_argument("name")
+    managed_rename.set_defaults(func=command_session_rename)
+
+    managed_inspect = managed_sub.add_parser("inspect", help="show indexed session metadata")
+    managed_inspect.add_argument("selector", nargs="?")
+    managed_inspect.add_argument("--native", action="store_true", help="also read Codex native metadata")
+    managed_inspect.set_defaults(func=command_session_inspect)
+
+    managed_archive = managed_sub.add_parser("archive", help="hide a session and archive Codex natively")
+    managed_archive.add_argument("selector", nargs="?")
+    managed_archive.set_defaults(func=command_session_archive)
+
+    managed_unarchive = managed_sub.add_parser("unarchive", help="restore an archived session")
+    managed_unarchive.add_argument("selector", nargs="?")
+    managed_unarchive.set_defaults(func=command_session_unarchive)
+
+    legacy_session = sub.add_parser(
+        "pair-session",
+        help="compatibility command: create or attach a fixed worker/peer tmux session",
+    )
+    legacy_session.add_argument("pair")
+    legacy_session.add_argument("role", choices=sorted(ROLE_ALIASES))
+    legacy_session.add_argument("--command", help="agent command; defaults to claude for worker and codex for peer")
+    legacy_session.set_defaults(func=command_session)
+
+    hook = sub.add_parser("hook", help="Claude lifecycle hook integration")
+    hook_sub = hook.add_subparsers(dest="hook_action", required=True)
+    hook_claude = hook_sub.add_parser("claude", help=argparse.SUPPRESS)
+    hook_claude.set_defaults(func=command_hook_claude)
+    hook_install = hook_sub.add_parser("install-claude", help="install Claude lifecycle hooks")
+    hook_install.add_argument("--settings", default=str(Path.home() / ".claude" / "settings.json"))
+    hook_install.add_argument(
+        "--retention-days",
+        type=int,
+        help="also set Claude cleanupPeriodDays; use 3650 for long-lived history",
+    )
+    hook_install.set_defaults(func=command_hook_install_claude)
 
     for command_name in ("send-peer", "send-review"):
         send_peer = sub.add_parser(command_name, help="archive worker handoff and request optional peer feedback")
@@ -486,11 +776,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+SESSION_ACTIONS = {"new", "resume", "finish", "rename", "inspect", "archive", "unarchive"}
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Preserve the v0.1 `session PAIR ROLE` spelling."""
+    result = list(argv)
+    try:
+        index = result.index("session")
+    except ValueError:
+        return result
+    if (
+        index + 1 < len(result)
+        and not result[index + 1].startswith("-")
+        and result[index + 1] not in SESSION_ACTIONS
+    ):
+        result[index] = "pair-session"
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    validate_pair(args.pair)
-    args.func(args)
+    selected_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(normalize_argv(selected_argv))
+    try:
+        args.func(args)
+    except (ProviderError, RegistryError, SessionManagerError) as exc:
+        parser.error(str(exc))
     return 0
 
 

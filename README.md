@@ -1,9 +1,8 @@
 # AgentsOwl
 
-AgentsOwl 是一个 terminal-first 的双 AI 协作工具：一个 AI 负责完成任务
-（worker），另一个 AI 可选地提供独立复核（peer）。它保存交接证据并在
-tmux 会话之间传递 prompt，但不把 peer 变成审批者，也不替代项目自己的
-规则、测试、human 裁决或发布流程。
+AgentsOwl 是一个 terminal-first 的 Codex/Claude Code 会话管理器，也保留
+可选的双 AI 协作工具。它直接索引 provider 自己的 session ID 和名称，把同
+一 topic 的 worker/peer 关联起来；不复制 transcript，不创建另一套会话身份。
 
 ## 原则
 
@@ -13,15 +12,17 @@ tmux 会话之间传递 prompt，但不把 peer 变成审批者，也不替代�
 - worker 可以接受、推迟或有证据地拒绝可选建议；human-only 决策仍由
   human 作出。
 - runtime artifact 默认位于 `~/.local/state/agents-owl/`，不污染业务仓库。
+- tmux 只是运行载体，不是会话身份；detach 或 tmux 消失后仍可按原生 ID resume。
 
-完整语义见 [docs/WORKFLOW.md](docs/WORKFLOW.md)，从旧 Research Gate v0
-迁移见 [docs/MIGRATION.md](docs/MIGRATION.md)。
+会话语义与完整命令见 [docs/SESSIONS.md](docs/SESSIONS.md)，可选双 AI 语义见
+[docs/WORKFLOW.md](docs/WORKFLOW.md)，从旧 Research Gate v0 迁移见
+[docs/MIGRATION.md](docs/MIGRATION.md)。
 
 ## 依赖
 
 - Python 3.10+
 - tmux
-- 至少一个可在终端运行的 agent；默认 worker=`claude`、peer=`codex`
+- Codex CLI 和/或 Claude Code
 
 工具只使用 Python 标准库。
 
@@ -33,19 +34,44 @@ chmod +x ~/workspace/agentsOwl/bin/agents-owl
 export PATH="$HOME/workspace/agentsOwl/bin:$PATH"
 
 cd /path/to/project
-agents-owl init my-project
-agents-owl session my-project worker
+agents-owl hook install-claude --retention-days 3650  # 只需一次；保留已有 settings
+agents-owl session new --provider claude --role worker --topic '实现 E-021'
 ```
 
-在 worker 会话中给出原始任务，并明确要求它读取启动横幅显示的 handoff
-template，完成后把交接写到横幅显示的 deliverable 路径。AgentsOwl 不会替
-human 自动生成任务内容。
-
-在另一个终端：
+一个 topic 完成后标记完成；新 topic 新开原生会话：
 
 ```bash
-cd /path/to/project
-agents-owl session my-project peer
+agents-owl sessions                 # 列表 → 编号选择 → action
+agents-owl session finish SESSION --outcome 'E-021 完成'
+agents-owl session new --provider codex --role worker --topic '实现 E-022'
+```
+
+同一 topic 需要第二视角时，启动另一个 provider/role。索引会自动建立关联：
+
+```bash
+agents-owl session new --provider codex --role peer --topic '实现 E-021'
+```
+
+Claude 的 `session_id` 由 `SessionStart` hook 回报；Codex 会话通过官方
+app-server 创建和命名。恢复始终使用原生 ID：
+
+```bash
+agents-owl session resume SESSION
+agents-owl session inspect SESSION --native  # --native 目前适用于 Codex
+agents-owl session archive SESSION
+agents-owl session unarchive SESSION
+```
+
+Codex archive/unarchive 会同步原生状态；Claude 没有对称的外部 archive API，
+所以 Claude archive 只影响 AgentsOwl 列表，不删除 provider transcript。
+
+## 可选 worker/peer 交接
+
+原 v0.1 的固定 pair 命令仍兼容。例如：
+
+```bash
+agents-owl init my-project
+agents-owl session my-project worker  # 兼容写法，等价于内部 pair-session
 ```
 
 worker 完成后写入 `agents-owl status my-project` 显示的
@@ -88,6 +114,16 @@ agents-owl decision my-project skip-peer --note 'Low-risk local change; project 
 ## 常用命令
 
 ```text
+agents-owl sessions [--all] [--provider codex|claude] [--role worker|peer] [--json]
+agents-owl session new --provider PROVIDER --role ROLE --topic TOPIC [--name NAME]
+agents-owl session resume [SESSION]
+agents-owl session finish [SESSION] [--outcome TEXT] [--stop]
+agents-owl session rename SESSION NAME
+agents-owl session inspect [SESSION] [--native]
+agents-owl session archive [SESSION]
+agents-owl session unarchive [SESSION]
+agents-owl hook install-claude
+
 agents-owl init PAIR
 agents-owl status PAIR
 agents-owl session PAIR worker|peer
@@ -116,6 +152,8 @@ AGENTS_OWL_REPO
 AGENTS_OWL_STATE_HOME
 AGENTS_OWL_WORKER_CMD
 AGENTS_OWL_PEER_CMD
+AGENTS_OWL_CODEX_CMD
+AGENTS_OWL_CLAUDE_CMD
 ```
 
 ## 测试

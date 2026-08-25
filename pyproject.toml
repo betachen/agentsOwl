@@ -1,7 +1,7 @@
 [project]
 name = "agents-owl"
-version = "0.1.0"
-description = "Optional terminal-first worker/peer collaboration for repository agents"
+version = "0.2.0"
+description = "Terminal-first native session management and optional worker/peer collaboration"
 requires-python = ">=3.10"
 license = "MIT"
 
