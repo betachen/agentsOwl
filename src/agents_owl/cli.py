@@ -520,7 +520,9 @@ def command_sessions(args: argparse.Namespace) -> None:
     if selected.lifecycle == "archived":
         actions.extend(["unarchive", "inspect"])
     else:
-        actions.extend(["resume", "inspect", "finish", "rename", "archive"])
+        if state != "running":
+            actions.extend(["resume-direct", "resume-tmux"])
+        actions.extend(["inspect", "finish", "rename", "archive"])
     actions = list(dict.fromkeys(actions))
     print("  ".join(f"{index}. {action}" for index, action in enumerate(actions, 1)))
     choice = input("Action [number, q]: ").strip()
@@ -537,8 +539,11 @@ def command_sessions(args: argparse.Namespace) -> None:
         if not selected.tmux_session:
             raise SessionManagerError("session has no tmux runtime")
         attach_tmux(selected.tmux_session)
-    if action == "resume":
-        resumed = manager.resume(selected)
+    if action == "resume-direct":
+        print(f"resuming {selected.key} directly", flush=True)
+        manager.resume(selected, use_tmux=False)
+    if action == "resume-tmux":
+        resumed = manager.resume(selected, use_tmux=True)
         if not resumed.tmux_session:
             raise SessionManagerError("session has no tmux runtime")
         attach_tmux(resumed.tmux_session)
@@ -572,10 +577,24 @@ def required_or_prompt(value: str | None, label: str) -> str:
 
 def command_session_new(args: argparse.Namespace) -> None:
     manager = session_manager(args)
+    if args.no_attach and not args.tmux:
+        raise SessionManagerError("--no-attach is only valid together with --tmux")
     provider = required_or_prompt(args.provider, "Provider (codex/claude)")
     topic = required_or_prompt(args.topic, "Topic")
     role = required_or_prompt(args.role, "Role (worker/peer)")
-    record = manager.new(provider=provider, topic=topic, role=role, native_name=args.name)
+    if not args.tmux:
+        manager.require_direct_terminal()
+    mode = "persistent tmux" if args.tmux else "direct native UI"
+    print(f"starting {provider} {role} in {mode}", flush=True)
+    record = manager.new(
+        provider=provider,
+        topic=topic,
+        role=role,
+        native_name=args.name,
+        use_tmux=args.tmux,
+    )
+    if not args.tmux:
+        return
     if record is None:
         tmux_name = make_tmux_name(manager.repo, topic, role)
         print(f"started Claude session in {tmux_name}; native id registration is pending")
@@ -589,8 +608,16 @@ def command_session_new(args: argparse.Namespace) -> None:
 
 def command_session_resume(args: argparse.Namespace) -> None:
     manager = session_manager(args)
+    if args.no_attach and not args.tmux:
+        raise SessionManagerError("--no-attach is only valid together with --tmux")
     record = resolve_managed_session(manager, args.selector, include_archived=False)
-    resumed = manager.resume(record)
+    if not args.tmux:
+        manager.require_direct_terminal()
+    mode = "persistent tmux" if args.tmux else "direct native UI"
+    print(f"resuming {record.key} in {mode}", flush=True)
+    resumed = manager.resume(record, use_tmux=args.tmux)
+    if not args.tmux:
+        return
     print(f"resumed {resumed.key}")
     if not args.no_attach and resumed.tmux_session:
         attach_tmux(resumed.tmux_session)
@@ -684,12 +711,30 @@ def build_parser() -> argparse.ArgumentParser:
     managed_new.add_argument("--topic")
     managed_new.add_argument("--role", choices=("worker", "peer"))
     managed_new.add_argument("--name", help="provider-native session name")
-    managed_new.add_argument("--no-attach", action="store_true")
+    managed_new.add_argument(
+        "--tmux",
+        action="store_true",
+        help="run in persistent tmux instead of the direct native terminal",
+    )
+    managed_new.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="with --tmux, leave the persistent runtime detached",
+    )
     managed_new.set_defaults(func=command_session_new)
 
     managed_resume = managed_sub.add_parser("resume", help="resume by native id, name, or index key")
     managed_resume.add_argument("selector", nargs="?")
-    managed_resume.add_argument("--no-attach", action="store_true")
+    managed_resume.add_argument(
+        "--tmux",
+        action="store_true",
+        help="run in persistent tmux instead of the direct native terminal",
+    )
+    managed_resume.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="with --tmux, leave the persistent runtime detached",
+    )
     managed_resume.set_defaults(func=command_session_resume)
 
     managed_finish = managed_sub.add_parser("finish", help="mark a topic session completed")

@@ -86,7 +86,8 @@ owl-<pair>-peer
 ```
 
 兼容命令 `session PAIR ROLE` 在会话不存在时创建，存在时直接 attach。用
-`Ctrl-b d` detach。新任务推荐使用 `session new`，其 tmux 名包含 repo、topic、
-role 和稳定 hash，原生 session ID 才是身份。
+`Ctrl-b d` detach。新任务推荐使用默认 direct 的 `session new`；只有显式
+`--tmux` 时才创建包含 repo、topic、role 和稳定 hash 的持久 runtime。无论
+是否使用 tmux，原生 session ID 才是身份。
 向 agent 注入 prompt 前，`send-peer`/`send-back` 会先验证 tmux target；可用
 `--target session:window.pane` 显式指定 pane。

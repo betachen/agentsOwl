@@ -44,6 +44,9 @@ alias rgr="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role peer"
 避免 alias 执行时变量不存在。v0.1 的 `session PAIR ROLE` 仍兼容，但只用于
 旧固定 pair tmux，不进入新的原生 session index。
 
+这些新 alias 默认进入 Claude/Codex 原生 TUI。需要断线存活时，在完整命令
+末尾显式加 `--tmux`；`--tmux --no-attach` 可只创建后台 runtime。
+
 ## 旧数据
 
 旧 `.agent-console` 数据不会自动删除。若其中有需要保留的历史，先复制到

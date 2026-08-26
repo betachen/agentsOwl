@@ -35,8 +35,8 @@ Alchemist 根目录的 `.agents-owl.json` 只列出权威文件，不复制规�
 
 ```text
 pair       列出全部 Alchemist 会话，编号选择后 resume/inspect/finish 等
-rgimpl     新建 Claude worker；交互输入本次 topic
-rgreview   新建 Codex advisory peer；输入与 worker 完全相同的 topic 即自动关联
+rgimpl     用原生 TUI 新建 Claude worker；交互输入本次 topic
+rgreview   用原生 TUI 新建 Codex peer；输入与 worker 完全相同的 topic 即关联
 rgi        只列 worker 会话并进入编号选择
 rgr        只列 peer 会话并进入编号选择
 ```
@@ -44,3 +44,12 @@ rgr        只列 peer 会话并进入编号选择
 一个 topic 完成后在 `pair` 中选择 `finish`，后续主题使用 `rgimpl` 新建会话。
 需要直接命令操作时，session selector 可使用原生 ID、唯一名称或
 `provider:native_session_id`。
+
+这五个入口默认不使用 tmux。预计连接可能中断且当前推理必须继续时，可直接：
+
+```bash
+rgimpl --tmux
+rgreview --tmux
+```
+
+再加 `--no-attach` 则只在后台创建持久 runtime。

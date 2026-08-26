@@ -11,8 +11,8 @@ topic
 ```
 
 唯一键是 `(provider, native_session_id)`。`native_name`、topic、role、repo、
-lifecycle、tmux 名称和关联会话只是索引字段。tmux 进程可以消失；恢复时仍将
-原生 ID 交给 `claude --resume` 或 `codex resume`。
+lifecycle、可选 tmux 名称和关联会话只是索引字段。默认运行完全不经过 tmux；
+恢复时直接将原生 ID 交给 `claude --resume` 或 `codex resume`。
 
 索引默认写在：
 
@@ -55,8 +55,23 @@ agents-owl session new \
 ```
 
 参数缺失且当前是交互终端时会逐项询问。默认原生名称是
-`<topic> [<role>]`；可以用 `--name` 指定。默认创建 tmux 后立即 attach，
-自动化或脚本中可加 `--no-attach`。
+`<topic> [<role>]`；可以用 `--name` 指定。默认直接进入 provider 原生 TUI，
+因此滚动、选取和剪贴板行为与直接运行 `claude`/`codex` 相同。
+命令必须从 tmux 外的普通 shell 启动；若环境已有 `$TMUX`，工具会拒绝伪 direct。
+
+只有需要让正在执行的 agent 在 SSH/terminal 异常断开后继续运行时使用：
+
+```bash
+agents-owl session new \
+  --provider claude \
+  --role worker \
+  --topic 'long-running topic' \
+  --tmux
+```
+
+`--tmux` 创建持久 runtime 并 attach。若明确要只在后台启动，加
+`--tmux --no-attach`。重新查看后台 TUI 时仍需 attach tmux，这是进程位于
+tmux PTY 中以抵抗断线的必要代价。
 
 需要可选 peer 时使用完全相同的 topic：
 
@@ -97,6 +112,10 @@ agents-owl session inspect [SESSION]
 agents-owl session finish [SESSION] --outcome '完成 E-021；测试通过'
 ```
 
+`resume` 默认也是 direct；需要持久 runtime 时显式加 `--tmux`。交互列表会
+分别显示 `resume-direct` 和 `resume-tmux`。若同一原生 session 已经在 tmux
+中运行，AgentsOwl 会拒绝并行 direct resume，避免两个 TUI 同时占用它。
+
 `finish` 默认只标记主题完成，不突然终止 TUI。明确希望同时关闭其 tmux 时：
 
 ```bash
@@ -109,11 +128,13 @@ agents-owl session finish SESSION --stop
 
 - `running`：对应 tmux 仍存在；
 - `suspended`：tmux 不存在，可以用原生 ID resume；
+- `direct`：该 session 使用原生终端模式；工具不冒充进程监控器，无法从外部
+  判断 direct TUI 此刻是否仍打开；
 - `completed`：主题任务已完成，仍可重新 resume；
 - `archived`：默认列表隐藏；
 - `missing`：已知原生对象在 provider 侧不可用。
 
-`finish` 会保存 outcome、完成时间和当前 repo 的 Git HEAD（如果存在）。v0.2
+`finish` 会保存 outcome、完成时间和当前 repo 的 Git HEAD（如果存在）。v0.3
 不提供 delete；历史记录默认可恢复，避免误删 provider transcript。
 
 ## Rename 与 archive 的 provider 差异
@@ -125,8 +146,8 @@ agents-owl session unarchive SESSION
 ```
 
 - Codex rename/archive/unarchive 直接调用官方 app-server，随后更新索引。
-- Claude rename 需要会话正在 managed tmux 中；AgentsOwl 发送 Claude 原生
-  `/rename` 命令，并同步索引。
+- Claude direct session 请在原生 TUI 中使用 `/rename`；CLI 的外部 rename
+  仅在 managed tmux 正在运行时可注入并同步索引。
 - Claude Code 没有与 Codex app-server 对称的外部 archive/unarchive API；
   因此 Claude archive 是 AgentsOwl 的列表视图，不触碰 Claude transcript。
 

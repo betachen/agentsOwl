@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agents_owl.cli import normalize_argv
 from agents_owl.registry import RegistryError, SessionRecord, SessionRegistry
-from agents_owl.session_manager import handle_claude_hook, install_claude_hooks, make_tmux_name
+from agents_owl.session_manager import (
+    SessionManager,
+    SessionManagerError,
+    handle_claude_hook,
+    install_claude_hooks,
+    make_tmux_name,
+    runtime_lifecycle,
+)
+
+
+class FakeCodex:
+    def create(self, repo: Path, name: str) -> dict[str, str]:
+        return {"id": "codex-native-id", "sessionId": "codex-native-id", "name": name}
+
+    def resume_command(self, native_session_id: str) -> list[str]:
+        return ["codex", "resume", native_session_id]
 
 
 class SessionRegistryTests(unittest.TestCase):
@@ -79,6 +96,28 @@ class SessionRegistryTests(unittest.TestCase):
         )
         self.assertFalse((empty_state / "sessions" / "index.json").exists())
 
+    def test_claude_hook_records_direct_runtime_without_tmux(self) -> None:
+        state = self.root / "direct-state"
+        environment = {
+            "AGENTS_OWL_MANAGED_SESSION": "1",
+            "AGENTS_OWL_STATE_HOME": str(state),
+            "AGENTS_OWL_REPO": str(self.repo),
+            "AGENTS_OWL_TOPIC": "direct-topic",
+            "AGENTS_OWL_ROLE": "worker",
+            "AGENTS_OWL_NATIVE_NAME": "direct-topic [worker]",
+        }
+        handle_claude_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-direct-id",
+                "cwd": str(self.repo),
+            },
+            environment,
+        )
+        record = SessionRegistry(state).resolve("claude-direct-id")
+        self.assertIsNone(record.tmux_session)
+        self.assertEqual(runtime_lifecycle(record), "direct")
+
     def test_hook_install_merges_and_is_idempotent(self) -> None:
         settings = self.root / "settings.json"
         settings.write_text(json.dumps({"model": "opus", "hooks": {"PreToolUse": []}}), encoding="utf-8")
@@ -103,6 +142,45 @@ class SessionRegistryTests(unittest.TestCase):
         )
         self.assertEqual(normalize_argv(["session", "new", "--topic", "x"])[0], "session")
         self.assertEqual(normalize_argv(["session", "--help"])[0], "session")
+
+    def test_new_codex_defaults_to_direct_native_launch(self) -> None:
+        manager = SessionManager(self.repo, self.root / "direct-manager", codex=FakeCodex())
+        with patch.dict(os.environ, {"TMUX": ""}), patch.object(
+            manager, "_launch_direct"
+        ) as launch, patch("agents_owl.session_manager.create_tmux") as create_tmux:
+            record = manager.new(provider="codex", topic="topic", role="worker")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertIsNone(record.tmux_session)
+        launch.assert_called_once()
+        create_tmux.assert_not_called()
+
+    def test_tmux_is_only_created_when_explicitly_requested(self) -> None:
+        manager = SessionManager(self.repo, self.root / "tmux-manager", codex=FakeCodex())
+        with patch.object(manager, "_launch_direct") as launch, patch(
+            "agents_owl.session_manager.create_tmux"
+        ) as create_tmux:
+            record = manager.new(
+                provider="codex",
+                topic="topic",
+                role="worker",
+                use_tmux=True,
+            )
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertIsNotNone(record.tmux_session)
+        create_tmux.assert_called_once()
+        launch.assert_not_called()
+
+    def test_direct_resume_rejects_a_live_tmux_runtime(self) -> None:
+        manager = SessionManager(self.repo, self.root / "resume-manager", codex=FakeCodex())
+        record = self.record("codex", "codex-running", "worker")
+        record.tmux_session = "owl-running"
+        manager.registry.upsert(record)
+        with patch.dict(os.environ, {"TMUX": ""}), patch(
+            "agents_owl.session_manager.tmux_has_session", return_value=True
+        ), self.assertRaisesRegex(SessionManagerError, "already running in tmux"):
+            manager.resume(record)
 
 
 if __name__ == "__main__":

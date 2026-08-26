@@ -43,7 +43,7 @@ def runtime_lifecycle(record: SessionRecord) -> str:
     if record.lifecycle == "active":
         if record.tmux_session and tmux_has_session(record.tmux_session):
             return "running"
-        return "suspended"
+        return "suspended" if record.tmux_session else "direct"
     return record.lifecycle
 
 
@@ -104,6 +104,7 @@ class SessionManager:
         topic: str,
         role: str,
         native_name: str | None = None,
+        use_tmux: bool = False,
     ) -> SessionRecord | None:
         topic = topic.strip()
         if not topic:
@@ -112,10 +113,12 @@ class SessionManager:
             raise SessionManagerError(f"unknown provider: {provider}")
         if role not in {"worker", "peer"}:
             raise SessionManagerError(f"unknown role: {role}")
+        if not use_tmux:
+            self.require_direct_terminal()
         name = (native_name or make_native_name(topic, role)).strip()
         if not name:
             raise SessionManagerError("native name must not be empty")
-        tmux_name = make_tmux_name(self.repo, topic, role)
+        tmux_name = make_tmux_name(self.repo, topic, role) if use_tmux else None
         environment = self._hook_environment(topic, role, name, tmux_name)
 
         if provider == "codex":
@@ -133,20 +136,40 @@ class SessionManager:
                 tmux_session=tmux_name,
             )
             self.registry.upsert(record)
-            create_tmux(tmux_name, self.repo, self.codex.resume_command(native_id), environment)
+            command = self.codex.resume_command(native_id)
+            if not use_tmux:
+                self._launch_direct(command, environment, self.repo)
+                return record
+            if tmux_name is None:
+                raise SessionManagerError("internal error: tmux runtime has no name")
+            create_tmux(tmux_name, self.repo, command, environment)
             return record
 
+        if not use_tmux:
+            self._launch_direct(claude_new_command(name), environment, self.repo)
+            return None
+        if tmux_name is None:
+            raise SessionManagerError("internal error: tmux runtime has no name")
         create_tmux(tmux_name, self.repo, claude_new_command(name), environment)
         return self._wait_for_claude_record(tmux_name)
 
-    def resume(self, record: SessionRecord) -> SessionRecord:
+    def resume(self, record: SessionRecord, *, use_tmux: bool = False) -> SessionRecord:
         if record.lifecycle == "archived":
             raise SessionManagerError("session is archived; unarchive it before resuming")
+        if not use_tmux:
+            self.require_direct_terminal()
         if record.tmux_session and tmux_has_session(record.tmux_session):
-            return record
-        tmux_name = record.tmux_session or make_tmux_name(
-            Path(record.repo), record.topic, record.role
-        )
+            if use_tmux:
+                return record
+            raise SessionManagerError(
+                f"session is already running in tmux {record.tmux_session}; "
+                "attach it or stop that runtime first"
+            )
+        tmux_name = None
+        if use_tmux:
+            tmux_name = record.tmux_session or make_tmux_name(
+                Path(record.repo), record.topic, record.role
+            )
         environment = self._hook_environment(
             record.topic,
             record.role,
@@ -158,13 +181,19 @@ class SessionManager:
             command = self.codex.resume_command(record.native_session_id)
         else:
             command = claude_resume_command(record.native_session_id)
-        create_tmux(tmux_name, Path(record.repo), command, environment)
-        return self.registry.update(
+        resumed = self.registry.update(
             record.key,
             lifecycle="active",
             tmux_session=tmux_name,
             completed_at=None,
         )
+        if not use_tmux:
+            self._launch_direct(command, environment, Path(record.repo))
+            return resumed
+        if tmux_name is None:
+            raise SessionManagerError("internal error: tmux runtime has no name")
+        create_tmux(tmux_name, Path(record.repo), command, environment)
+        return resumed
 
     def finish(self, record: SessionRecord, outcome: str = "", stop: bool = False) -> SessionRecord:
         if stop and record.tmux_session and tmux_has_session(record.tmux_session):
@@ -223,20 +252,22 @@ class SessionManager:
         topic: str,
         role: str,
         native_name: str,
-        tmux_session: str,
+        tmux_session: str | None,
         *,
         repo: Path | None = None,
     ) -> dict[str, str]:
         selected_repo = (repo or self.repo).resolve()
-        return {
+        environment = {
             "AGENTS_OWL_MANAGED_SESSION": "1",
             "AGENTS_OWL_STATE_HOME": str(self.state_home),
             "AGENTS_OWL_REPO": str(selected_repo),
             "AGENTS_OWL_TOPIC": topic,
             "AGENTS_OWL_ROLE": role,
             "AGENTS_OWL_NATIVE_NAME": native_name,
-            "AGENTS_OWL_TMUX_SESSION": tmux_session,
         }
+        if tmux_session is not None:
+            environment["AGENTS_OWL_TMUX_SESSION"] = tmux_session
+        return environment
 
     def _wait_for_claude_record(self, tmux_name: str) -> SessionRecord | None:
         deadline = time.monotonic() + 5
@@ -261,6 +292,25 @@ class SessionManager:
         )
         value = result.stdout.strip()
         return [value] if result.returncode == 0 and value else []
+
+    @staticmethod
+    def _launch_direct(command: list[str], environment: dict[str, str], repo: Path) -> None:
+        SessionManager.require_direct_terminal()
+        selected_environment = os.environ.copy()
+        selected_environment.update(environment)
+        try:
+            os.chdir(repo)
+            os.execvpe(command[0], command, selected_environment)
+        except OSError as exc:
+            raise SessionManagerError(f"could not start {command[0]} directly: {exc}") from exc
+
+    @staticmethod
+    def require_direct_terminal() -> None:
+        if os.environ.get("TMUX"):
+            raise SessionManagerError(
+                "direct native UI was requested from inside tmux; detach or open a plain terminal, "
+                "then run the command again"
+            )
 
     @staticmethod
     def _inject(tmux_session: str, prompt: str) -> None:
