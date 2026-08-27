@@ -34,17 +34,17 @@ Alchemist 根目录的 `.agents-owl.json` 只列出权威文件，不复制规�
 新 shell（或 `source ~/.bashrc`）中：
 
 ```text
-pair       列出全部 Alchemist 会话，编号选择后 attach/resume/inspect/finish 等
-rgimpl     新建受断线保护的 Claude worker；交互输入本次 topic
-rgreview   新建受断线保护的 Codex peer；输入相同 topic 即关联
-rgi        只列 worker 会话并进入编号选择
-rgr        只列 peer 会话并进入编号选择
+ff          列出全部 Alchemist 会话，编号选择后执行 action
+ff i        只列 worker 会话
+ff r        只列 peer 会话
+ff impl     新建受断线保护的 Claude worker；交互输入本次 topic
+ff review   新建受断线保护的 Codex peer；输入相同 topic 即关联
 ```
 
-一个 topic 完成后在 `pair` 中选择 `finish`，后续主题使用 `rgimpl` 新建会话。
+一个 topic 完成后在 `ff` 中选择 `finish`，后续主题使用 `ff impl` 新建会话。
 需要直接命令操作时，session selector 可使用原生 ID、唯一名称或
 `provider:native_session_id`。
 
 五个入口统一由 AgentsOwl 的透明 PTY 保护。SSH 突然断开后，agent 继续运行；
-重新登录并执行 `pair`、`rgi` 或 `rgr`，选择 `running` 会话 attach。正常使用
+重新登录并执行 `ff`、`ff i` 或 `ff r`，选择 `running` 会话 attach。正常使用
 Claude `/exit` 或 Codex `/quit` 时，保护 runtime 随进程结束，原生历史不变。

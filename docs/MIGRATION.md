@@ -27,25 +27,28 @@ review/reviewer      → peer
 
 ## Shell alias 迁移
 
-五个旧别名可以保留名称，并切换为原生 session 列表/选择器：
+删除五个旧 alias，只保留一个指向项目的 `ff`：
 
 ```bash
-AGENTS_OWL_BIN="$HOME/workspace/agentsOwl/bin/agents-owl"
-PROJECT_REPO="$HOME/workspace/example"
-
-alias rgimpl="cd $PROJECT_REPO && $AGENTS_OWL_BIN session new --provider claude --role worker"
-alias rgreview="cd $PROJECT_REPO && $AGENTS_OWL_BIN session new --provider codex --role peer"
-alias pair="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions"
-alias rgi="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role worker"
-alias rgr="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role peer"
+alias ff='cd /path/to/project && /path/to/agentsOwl/bin/agents-owl'
 ```
 
-实际 `.bashrc` 中应把 `$PROJECT_REPO` 和 `$AGENTS_OWL_BIN` 展开成完整路径，
-避免 alias 执行时变量不存在。v0.1 的 `session PAIR ROLE` 仍兼容，但只用于
-固定 pair runtime，不进入新的原生 session index。
+旧行为已经迁入 AgentsOwl 参数：
 
-这些 alias 默认进入由透明 PTY 保护的 Claude/Codex 原生 TUI。SSH 异常断开
-后重新执行 `pair`，选择 `running` 会话并 attach；不需要额外启动参数。
+```text
+ff          → 全部 session 列表/选择器
+ff i        → worker session 列表/选择器
+ff r        → peer session 列表/选择器
+ff impl     → 新建 Claude worker
+ff review   → 新建 Codex peer
+```
+
+实际 `.bashrc` 中使用完整路径，避免 alias 执行时变量不存在。v0.1 的
+`session PAIR ROLE` 仍兼容，但只用于固定 pair runtime，不进入新的原生
+session index。
+
+这些入口默认进入由透明 PTY 保护的 Claude/Codex 原生 TUI。SSH 异常断开
+后重新执行 `ff`，选择 `running` 会话并 attach；不需要额外启动参数。
 
 ## 旧数据
 

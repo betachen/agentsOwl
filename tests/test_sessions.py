@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agents_owl.cli import normalize_argv
+from agents_owl.cli import build_parser, normalize_argv
 from agents_owl.registry import RegistryError, SessionRecord, SessionRegistry
 from agents_owl.session_manager import (
     SessionManager,
@@ -160,6 +160,16 @@ class SessionRegistryTests(unittest.TestCase):
         )
         self.assertEqual(normalize_argv(["session", "new", "--topic", "x"])[0], "session")
         self.assertEqual(normalize_argv(["session", "--help"])[0], "session")
+
+    def test_short_commands_map_to_provider_roles(self) -> None:
+        parser = build_parser()
+        impl = parser.parse_args(["impl", "topic"])
+        self.assertEqual((impl.provider, impl.role, impl.topic), ("claude", "worker", "topic"))
+        review = parser.parse_args(["review", "topic"])
+        self.assertEqual((review.provider, review.role, review.topic), ("codex", "peer", "topic"))
+        self.assertEqual(parser.parse_args(["i"]).role, "worker")
+        self.assertEqual(parser.parse_args(["r"]).role, "peer")
+        self.assertEqual(normalize_argv([]), ["sessions"])
 
     def test_new_codex_always_uses_protected_runtime(self) -> None:
         manager = SessionManager(self.repo, self.root / "protected-manager", codex=FakeCodex())

@@ -56,6 +56,18 @@ agents-owl hook install-claude --retention-days 3650
 
 ## 日常流程
 
+如果为项目配置了 `ff` alias，最短入口是：
+
+```bash
+ff                 # 全部会话
+ff i               # worker 列表
+ff r               # peer 列表
+ff impl [TOPIC]    # 新建 Claude worker
+ff review [TOPIC]  # 新建 Codex peer
+```
+
+这些只是 AgentsOwl 内置子命令的短入口，不是 shell 中五套独立逻辑。
+
 新主题新会话：
 
 ```bash

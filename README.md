@@ -43,6 +43,20 @@ agents-owl hook install-claude --retention-days 3650  # 只需一次；保留已
 agents-owl session new --provider claude --role worker --topic '实现 E-021'
 ```
 
+可选的单 alias 入口：
+
+```bash
+alias ff='cd /path/to/project && /path/to/agentsOwl/bin/agents-owl'
+
+ff                 # 全部会话：列表 → 选择 → action
+ff i               # worker 会话
+ff r               # peer 会话
+ff impl             # 新建 Claude worker，交互输入 topic
+ff review           # 新建 Codex peer，交互输入 topic
+ff impl 'topic'     # 也可直接给 topic
+ff review 'topic'
+```
+
 AgentsOwl 默认立即进入 Claude/Codex 原生 TUI。外层 `dtach` 没有窗口、状态栏
 或终端模拟层；它只在 SSH/terminal 突然消失时保住 agent：
 
@@ -133,6 +147,10 @@ agents-owl decision my-project skip-peer --note 'Low-risk local change; project 
 
 ```text
 agents-owl sessions [--all] [--provider codex|claude] [--role worker|peer] [--json]
+agents-owl impl [TOPIC] [--name NAME]
+agents-owl review [TOPIC] [--name NAME]
+agents-owl i [--all] [--provider codex|claude] [--json]
+agents-owl r [--all] [--provider codex|claude] [--json]
 agents-owl session new --provider PROVIDER --role ROLE --topic TOPIC [--name NAME]
 agents-owl session resume [SESSION]
 agents-owl session attach [SESSION]

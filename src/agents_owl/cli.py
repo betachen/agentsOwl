@@ -652,6 +652,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-home", help="runtime state root; defaults to AGENTS_OWL_STATE_HOME or XDG state")
     sub = parser.add_subparsers(dest="command_name", required=True)
 
+    impl = sub.add_parser("impl", help="start a Claude worker session")
+    impl.add_argument("topic", nargs="?")
+    impl.add_argument("--name", help="provider-native session name")
+    impl.set_defaults(func=command_session_new, provider="claude", role="worker")
+
+    review = sub.add_parser("review", help="start a Codex peer session")
+    review.add_argument("topic", nargs="?")
+    review.add_argument("--name", help="provider-native session name")
+    review.set_defaults(func=command_session_new, provider="codex", role="peer")
+
+    workers = sub.add_parser("i", help="list and select worker sessions")
+    add_session_list_arguments(workers)
+    workers.set_defaults(func=command_sessions, role="worker")
+
+    peers = sub.add_parser("r", help="list and select peer sessions")
+    add_session_list_arguments(peers)
+    peers.set_defaults(func=command_sessions, role="peer")
+
     init = sub.add_parser("init", help="initialize or refresh a pair")
     init.add_argument("pair")
     init.set_defaults(func=command_init)
@@ -661,12 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=command_status)
 
     sessions = sub.add_parser("sessions", help="list and select native Codex/Claude sessions")
-    sessions.add_argument("--provider", choices=("codex", "claude"))
-    sessions.add_argument("--role", choices=("worker", "peer"))
-    sessions.add_argument("--all", action="store_true", help="include archived sessions")
-    sessions.add_argument("--global", dest="global_scope", action="store_true", help="include all repositories")
-    sessions.add_argument("--json", action="store_true")
-    sessions.add_argument("--no-select", action="store_true", help="only print the list")
+    add_session_list_arguments(sessions, include_role=True)
     sessions.set_defaults(func=command_sessions)
 
     managed_session = sub.add_parser("session", help="manage provider-native sessions")
@@ -770,12 +783,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def add_session_list_arguments(parser: argparse.ArgumentParser, *, include_role: bool = False) -> None:
+    parser.add_argument("--provider", choices=("codex", "claude"))
+    if include_role:
+        parser.add_argument("--role", choices=("worker", "peer"))
+    parser.add_argument("--all", action="store_true", help="include archived sessions")
+    parser.add_argument("--global", dest="global_scope", action="store_true", help="include all repositories")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-select", action="store_true", help="only print the list")
+
+
 SESSION_ACTIONS = {"new", "resume", "attach", "finish", "rename", "inspect", "archive", "unarchive"}
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
     """Preserve the v0.1 `session PAIR ROLE` spelling."""
     result = list(argv)
+    if not result:
+        return ["sessions"]
     try:
         index = result.index("session")
     except ValueError:
