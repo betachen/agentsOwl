@@ -41,7 +41,7 @@ class SessionRecord:
     role: str
     repo: str
     lifecycle: str = "active"
-    tmux_session: str | None = None
+    runtime_socket: str | None = None
     related_session_keys: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
@@ -75,6 +75,8 @@ class SessionRecord:
             isinstance(item, str) for item in self.related_session_keys
         ):
             raise RegistryError("related_session_keys must be a list of strings")
+        if self.runtime_socket is not None and not isinstance(self.runtime_socket, str):
+            raise RegistryError("runtime_socket must be a string or null")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()

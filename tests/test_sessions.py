@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,8 +14,9 @@ from agents_owl.session_manager import (
     SessionManagerError,
     handle_claude_hook,
     install_claude_hooks,
-    make_tmux_name,
+    make_runtime_socket,
     runtime_lifecycle,
+    runtime_state,
 )
 
 
@@ -74,7 +75,7 @@ class SessionRegistryTests(unittest.TestCase):
             "AGENTS_OWL_TOPIC": "topic",
             "AGENTS_OWL_ROLE": "worker",
             "AGENTS_OWL_NATIVE_NAME": "topic [worker]",
-            "AGENTS_OWL_TMUX_SESSION": "owl-test",
+            "AGENTS_OWL_RUNTIME_SOCKET": str(self.root / "managed.sock"),
         }
         handle_claude_hook(
             {
@@ -86,7 +87,7 @@ class SessionRegistryTests(unittest.TestCase):
             environment,
         )
         record = SessionRegistry(state).resolve("claude-native-id")
-        self.assertEqual(record.tmux_session, "owl-test")
+        self.assertEqual(record.runtime_socket, str(self.root / "managed.sock"))
         self.assertEqual(record.topic, "topic")
 
         empty_state = self.root / "empty"
@@ -96,27 +97,30 @@ class SessionRegistryTests(unittest.TestCase):
         )
         self.assertFalse((empty_state / "sessions" / "index.json").exists())
 
-    def test_claude_hook_records_direct_runtime_without_tmux(self) -> None:
-        state = self.root / "direct-state"
+    def test_claude_hook_preserves_existing_runtime_when_environment_omits_it(self) -> None:
+        state = self.root / "existing-state"
+        existing = self.record("claude", "claude-existing-id", "worker")
+        existing.runtime_socket = str(self.root / "existing.sock")
+        SessionRegistry(state).upsert(existing)
         environment = {
             "AGENTS_OWL_MANAGED_SESSION": "1",
             "AGENTS_OWL_STATE_HOME": str(state),
             "AGENTS_OWL_REPO": str(self.repo),
-            "AGENTS_OWL_TOPIC": "direct-topic",
+            "AGENTS_OWL_TOPIC": "topic",
             "AGENTS_OWL_ROLE": "worker",
-            "AGENTS_OWL_NATIVE_NAME": "direct-topic [worker]",
+            "AGENTS_OWL_NATIVE_NAME": "topic [worker]",
         }
         handle_claude_hook(
             {
                 "hook_event_name": "SessionStart",
-                "session_id": "claude-direct-id",
+                "session_id": "claude-existing-id",
                 "cwd": str(self.repo),
             },
             environment,
         )
-        record = SessionRegistry(state).resolve("claude-direct-id")
-        self.assertIsNone(record.tmux_session)
-        self.assertEqual(runtime_lifecycle(record), "direct")
+        record = SessionRegistry(state).resolve("claude-existing-id")
+        self.assertEqual(record.runtime_socket, str(self.root / "existing.sock"))
+        self.assertEqual(runtime_lifecycle(record), "exited")
 
     def test_hook_install_merges_and_is_idempotent(self) -> None:
         settings = self.root / "settings.json"
@@ -129,11 +133,25 @@ class SessionRegistryTests(unittest.TestCase):
         self.assertEqual(len(value["hooks"]["SessionStart"]), 1)
         self.assertEqual(len(value["hooks"]["SessionEnd"]), 1)
 
-    def test_tmux_name_is_stable_and_topic_sensitive(self) -> None:
-        first = make_tmux_name(self.repo, "中文主题", "worker")
-        self.assertEqual(first, make_tmux_name(self.repo, "中文主题", "worker"))
-        self.assertNotEqual(first, make_tmux_name(self.repo, "另一主题", "worker"))
-        self.assertRegex(first, r"^[a-z0-9-]+$")
+    def test_runtime_socket_is_stable_with_discriminator_and_topic_sensitive(self) -> None:
+        state = self.root / "state"
+        first = make_runtime_socket(state, self.repo, "中文主题", "worker", "fixed")
+        self.assertEqual(first, make_runtime_socket(state, self.repo, "中文主题", "worker", "fixed"))
+        self.assertNotEqual(first, make_runtime_socket(state, self.repo, "另一主题", "worker", "fixed"))
+        self.assertEqual(first.parent, state / "runtimes")
+        self.assertRegex(first.name, r"^[a-f0-9]{20}\.sock$")
+
+    def test_runtime_state_distinguishes_running_exited_and_orphaned(self) -> None:
+        path = self.root / "probe.sock"
+        self.assertEqual(runtime_state(str(path)), "exited")
+        path.write_text("not a socket", encoding="utf-8")
+        self.assertEqual(runtime_state(str(path)), "orphaned")
+        path.unlink()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(str(path))
+        server.listen()
+        self.assertEqual(runtime_state(str(path)), "running")
 
     def test_legacy_session_spelling_is_preserved(self) -> None:
         self.assertEqual(
@@ -143,44 +161,34 @@ class SessionRegistryTests(unittest.TestCase):
         self.assertEqual(normalize_argv(["session", "new", "--topic", "x"])[0], "session")
         self.assertEqual(normalize_argv(["session", "--help"])[0], "session")
 
-    def test_new_codex_defaults_to_direct_native_launch(self) -> None:
-        manager = SessionManager(self.repo, self.root / "direct-manager", codex=FakeCodex())
-        with patch.dict(os.environ, {"TMUX": ""}), patch.object(
-            manager, "_launch_direct"
-        ) as launch, patch("agents_owl.session_manager.create_tmux") as create_tmux:
+    def test_new_codex_always_uses_protected_runtime(self) -> None:
+        manager = SessionManager(self.repo, self.root / "protected-manager", codex=FakeCodex())
+        with patch.object(manager, "_launch_runtime") as launch:
             record = manager.new(provider="codex", topic="topic", role="worker")
         self.assertIsNotNone(record)
         assert record is not None
-        self.assertIsNone(record.tmux_session)
+        self.assertIsNotNone(record.runtime_socket)
         launch.assert_called_once()
-        create_tmux.assert_not_called()
 
-    def test_tmux_is_only_created_when_explicitly_requested(self) -> None:
-        manager = SessionManager(self.repo, self.root / "tmux-manager", codex=FakeCodex())
-        with patch.object(manager, "_launch_direct") as launch, patch(
-            "agents_owl.session_manager.create_tmux"
-        ) as create_tmux:
-            record = manager.new(
-                provider="codex",
-                topic="topic",
-                role="worker",
-                use_tmux=True,
-            )
-        self.assertIsNotNone(record)
-        assert record is not None
-        self.assertIsNotNone(record.tmux_session)
-        create_tmux.assert_called_once()
-        launch.assert_not_called()
-
-    def test_direct_resume_rejects_a_live_tmux_runtime(self) -> None:
+    def test_resume_attaches_existing_live_runtime(self) -> None:
         manager = SessionManager(self.repo, self.root / "resume-manager", codex=FakeCodex())
         record = self.record("codex", "codex-running", "worker")
-        record.tmux_session = "owl-running"
+        record.runtime_socket = str(self.root / "running.sock")
         manager.registry.upsert(record)
-        with patch.dict(os.environ, {"TMUX": ""}), patch(
-            "agents_owl.session_manager.tmux_has_session", return_value=True
-        ), self.assertRaisesRegex(SessionManagerError, "already running in tmux"):
+        with patch("agents_owl.session_manager.runtime_state", return_value="running"), patch(
+            "agents_owl.session_manager.attach_runtime"
+        ) as attach:
             manager.resume(record)
+        attach.assert_called_once_with(record.runtime_socket)
+
+    def test_finish_rejects_a_live_runtime(self) -> None:
+        manager = SessionManager(self.repo, self.root / "finish-manager", codex=FakeCodex())
+        record = self.record("codex", "codex-running", "worker")
+        record.runtime_socket = str(self.root / "running.sock")
+        with patch("agents_owl.session_manager.runtime_state", return_value="running"), self.assertRaisesRegex(
+            SessionManagerError, "still running"
+        ):
+            manager.finish(record)
 
 
 if __name__ == "__main__":

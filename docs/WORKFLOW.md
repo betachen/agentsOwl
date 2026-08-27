@@ -76,7 +76,7 @@ Peer 不拥有 veto。它不能冻结路线、批准发布、扩大任务，或�
 
 所有正式状态变化仍使用项目自己的权威机制。
 
-## tmux 与并发
+## 保护 runtime 与并发
 
 v0.1 兼容 pair session 名为：
 
@@ -85,9 +85,9 @@ owl-<pair>-worker
 owl-<pair>-peer
 ```
 
-兼容命令 `session PAIR ROLE` 在会话不存在时创建，存在时直接 attach。用
-`Ctrl-b d` detach。新任务推荐使用默认 direct 的 `session new`；只有显式
-`--tmux` 时才创建包含 repo、topic、role 和稳定 hash 的持久 runtime。无论
-是否使用 tmux，原生 session ID 才是身份。
-向 agent 注入 prompt 前，`send-peer`/`send-back` 会先验证 tmux target；可用
-`--target session:window.pane` 显式指定 pane。
+兼容命令 `session PAIR ROLE` 在 runtime 不存在时创建，存在时直接 attach。
+无论使用新会话索引还是固定 pair，AgentsOwl 都通过透明 `dtach` PTY 抵抗
+SSH 断线；原生 session ID 仍是身份。
+
+向 agent 注入 prompt 前，`send-peer`/`send-back` 会先验证对应 runtime socket；
+必要时可用 `--target /path/to/runtime.sock` 显式指定。

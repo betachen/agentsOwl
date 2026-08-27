@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shlex
+import shutil
+import socket
+import stat
 import subprocess
 import tempfile
-import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,24 +28,45 @@ class SessionManagerError(RuntimeError):
     """Raised for a user-facing session management failure."""
 
 
-def tmux_has_session(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+def dtach_command() -> list[str]:
+    return shlex.split(os.environ.get("AGENTS_OWL_DTACH_CMD", "dtach"))
+
+
+def require_dtach() -> list[str]:
+    command = dtach_command()
+    if not command or shutil.which(command[0]) is None:
+        raise SessionManagerError(
+            "dtach is required for disconnect-safe sessions; install it with: sudo apt install dtach"
         )
-    except FileNotFoundError as exc:
-        raise SessionManagerError("tmux is not installed or not on PATH") from exc
-    return result.returncode == 0
+    return command
+
+
+def runtime_state(runtime_socket: str | None) -> str:
+    if not runtime_socket:
+        return "exited"
+    path = Path(runtime_socket)
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return "exited"
+    except OSError:
+        return "orphaned"
+    if not stat.S_ISSOCK(mode):
+        return "orphaned"
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(str(path))
+    except OSError:
+        return "orphaned"
+    finally:
+        probe.close()
+    return "running"
 
 
 def runtime_lifecycle(record: SessionRecord) -> str:
     if record.lifecycle == "active":
-        if record.tmux_session and tmux_has_session(record.tmux_session):
-            return "running"
-        return "suspended" if record.tmux_session else "direct"
+        return runtime_state(record.runtime_socket)
     return record.lifecycle
 
 
@@ -51,43 +74,80 @@ def make_native_name(topic: str, role: str) -> str:
     return f"{topic.strip()} [{role}]"
 
 
-def make_tmux_name(repo: Path, topic: str, role: str) -> str:
-    readable = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:24]
-    if not readable:
-        readable = "topic"
-    digest = hashlib.sha256(f"{repo}:{topic}:{role}".encode()).hexdigest()[:8]
-    repo_name = re.sub(r"[^a-z0-9]+", "-", repo.name.lower()).strip("-") or "repo"
-    return f"owl-{repo_name[:20]}-{readable}-{role}-{digest}"
+def make_runtime_socket(
+    state_home: Path,
+    repo: Path,
+    topic: str,
+    role: str,
+    discriminator: str | None = None,
+) -> Path:
+    identity = discriminator or uuid.uuid4().hex
+    digest = hashlib.sha256(f"{repo.resolve()}:{topic}:{role}:{identity}".encode()).hexdigest()[:20]
+    path = state_home.resolve() / "runtimes" / f"{digest}.sock"
+    if len(os.fsencode(path)) >= 104:
+        raise SessionManagerError(
+            f"runtime socket path is too long for a Unix socket: {path}; choose a shorter --state-home"
+        )
+    return path
 
 
-def shell_command(command: list[str], environment: dict[str, str]) -> str:
-    assignments = " ".join(
-        f"{key}={shlex.quote(value)}" for key, value in sorted(environment.items())
-    )
-    executable = " ".join(shlex.quote(item) for item in command)
-    return f"exec env {assignments} {executable}"
+def _prepare_runtime_socket(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = runtime_state(str(path))
+    if state == "running":
+        raise SessionManagerError(f"runtime is already running: {path}")
+    if not path.exists():
+        return
+    if not stat.S_ISSOCK(path.stat().st_mode):
+        raise SessionManagerError(f"refusing to replace non-socket runtime path: {path}")
+    path.unlink()
 
 
-def create_tmux(name: str, repo: Path, command: list[str], environment: dict[str, str]) -> None:
-    if tmux_has_session(name):
-        raise SessionManagerError(f"tmux session already exists: {name}")
+def launch_runtime(
+    runtime_socket: Path,
+    repo: Path,
+    command: list[str],
+    environment: dict[str, str],
+) -> None:
+    dtach = require_dtach()
+    _prepare_runtime_socket(runtime_socket)
+    selected_environment = os.environ.copy()
+    selected_environment.update(environment)
+    argv = [*dtach, "-c", str(runtime_socket), "-Ez", "-r", "winch", *command]
+    try:
+        os.chdir(repo)
+        os.execvpe(argv[0], argv, selected_environment)
+    except OSError as exc:
+        raise SessionManagerError(f"could not start protected runtime: {exc}") from exc
+
+
+def attach_runtime(runtime_socket: str) -> None:
+    if runtime_state(runtime_socket) != "running":
+        raise SessionManagerError(f"runtime is not running: {runtime_socket}")
+    dtach = require_dtach()
+    argv = [*dtach, "-a", runtime_socket, "-Ez", "-r", "winch"]
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        raise SessionManagerError(f"could not attach runtime {runtime_socket}: {exc}") from exc
+
+
+def inject_runtime(runtime_socket: str, prompt: str) -> None:
+    if runtime_state(runtime_socket) != "running":
+        raise SessionManagerError(f"runtime is not running: {runtime_socket}")
+    dtach = require_dtach()
     try:
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", name, "-c", str(repo), shell_command(command, environment)],
+            [*dtach, "-p", runtime_socket],
+            input=f"{prompt}\n",
+            text=True,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            text=True,
         )
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() if exc.stderr else "unknown tmux error"
-        raise SessionManagerError(f"could not create tmux session {name}: {detail}") from exc
-
-
-def attach_tmux(name: str) -> None:
-    if not tmux_has_session(name):
-        raise SessionManagerError(f"tmux session does not exist: {name}")
-    os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+        detail = exc.stderr.strip() if exc.stderr else "unknown error"
+        raise SessionManagerError(f"could not send input to runtime {runtime_socket}: {detail}") from exc
 
 
 class SessionManager:
@@ -104,7 +164,6 @@ class SessionManager:
         topic: str,
         role: str,
         native_name: str | None = None,
-        use_tmux: bool = False,
     ) -> SessionRecord | None:
         topic = topic.strip()
         if not topic:
@@ -113,13 +172,11 @@ class SessionManager:
             raise SessionManagerError(f"unknown provider: {provider}")
         if role not in {"worker", "peer"}:
             raise SessionManagerError(f"unknown role: {role}")
-        if not use_tmux:
-            self.require_direct_terminal()
         name = (native_name or make_native_name(topic, role)).strip()
         if not name:
             raise SessionManagerError("native name must not be empty")
-        tmux_name = make_tmux_name(self.repo, topic, role) if use_tmux else None
-        environment = self._hook_environment(topic, role, name, tmux_name)
+        runtime_socket = make_runtime_socket(self.state_home, self.repo, topic, role)
+        environment = self._hook_environment(topic, role, name, runtime_socket)
 
         if provider == "codex":
             thread = self.codex.create(self.repo, name)
@@ -133,48 +190,36 @@ class SessionManager:
                 topic=topic,
                 role=role,
                 repo=str(self.repo),
-                tmux_session=tmux_name,
+                runtime_socket=str(runtime_socket),
             )
             self.registry.upsert(record)
             command = self.codex.resume_command(native_id)
-            if not use_tmux:
-                self._launch_direct(command, environment, self.repo)
-                return record
-            if tmux_name is None:
-                raise SessionManagerError("internal error: tmux runtime has no name")
-            create_tmux(tmux_name, self.repo, command, environment)
+            self._launch_runtime(runtime_socket, command, environment, self.repo)
             return record
 
-        if not use_tmux:
-            self._launch_direct(claude_new_command(name), environment, self.repo)
-            return None
-        if tmux_name is None:
-            raise SessionManagerError("internal error: tmux runtime has no name")
-        create_tmux(tmux_name, self.repo, claude_new_command(name), environment)
-        return self._wait_for_claude_record(tmux_name)
+        self._launch_runtime(runtime_socket, claude_new_command(name), environment, self.repo)
+        return None
 
-    def resume(self, record: SessionRecord, *, use_tmux: bool = False) -> SessionRecord:
+    def resume(self, record: SessionRecord) -> SessionRecord:
         if record.lifecycle == "archived":
             raise SessionManagerError("session is archived; unarchive it before resuming")
-        if not use_tmux:
-            self.require_direct_terminal()
-        if record.tmux_session and tmux_has_session(record.tmux_session):
-            if use_tmux:
-                return record
-            raise SessionManagerError(
-                f"session is already running in tmux {record.tmux_session}; "
-                "attach it or stop that runtime first"
-            )
-        tmux_name = None
-        if use_tmux:
-            tmux_name = record.tmux_session or make_tmux_name(
-                Path(record.repo), record.topic, record.role
-            )
+        if runtime_state(record.runtime_socket) == "running":
+            if not record.runtime_socket:
+                raise SessionManagerError("running session has no runtime socket")
+            attach_runtime(record.runtime_socket)
+            return record
+        runtime_socket = Path(record.runtime_socket) if record.runtime_socket else make_runtime_socket(
+            self.state_home,
+            Path(record.repo),
+            record.topic,
+            record.role,
+            discriminator=record.key,
+        )
         environment = self._hook_environment(
             record.topic,
             record.role,
             record.native_name,
-            tmux_name,
+            runtime_socket,
             repo=Path(record.repo),
         )
         if record.provider == "codex":
@@ -184,20 +229,17 @@ class SessionManager:
         resumed = self.registry.update(
             record.key,
             lifecycle="active",
-            tmux_session=tmux_name,
+            runtime_socket=str(runtime_socket),
             completed_at=None,
         )
-        if not use_tmux:
-            self._launch_direct(command, environment, Path(record.repo))
-            return resumed
-        if tmux_name is None:
-            raise SessionManagerError("internal error: tmux runtime has no name")
-        create_tmux(tmux_name, Path(record.repo), command, environment)
+        self._launch_runtime(runtime_socket, command, environment, Path(record.repo))
         return resumed
 
-    def finish(self, record: SessionRecord, outcome: str = "", stop: bool = False) -> SessionRecord:
-        if stop and record.tmux_session and tmux_has_session(record.tmux_session):
-            subprocess.run(["tmux", "kill-session", "-t", record.tmux_session], check=True)
+    def finish(self, record: SessionRecord, outcome: str = "") -> SessionRecord:
+        if runtime_state(record.runtime_socket) == "running":
+            raise SessionManagerError(
+                "session is still running; exit the provider session normally before marking it completed"
+            )
         return self.registry.update(
             record.key,
             lifecycle="completed",
@@ -213,16 +255,16 @@ class SessionManager:
         if record.provider == "codex":
             self.codex.rename(record.native_session_id, name)
         else:
-            if not record.tmux_session or not tmux_has_session(record.tmux_session):
+            if runtime_state(record.runtime_socket) != "running" or not record.runtime_socket:
                 raise SessionManagerError(
                     "Claude rename requires a running managed session; resume it first"
                 )
-            self._inject(record.tmux_session, f"/rename {name}")
+            inject_runtime(record.runtime_socket, f"/rename {name}")
         return self.registry.update(record.key, native_name=name)
 
     def archive(self, record: SessionRecord) -> SessionRecord:
-        if record.tmux_session and tmux_has_session(record.tmux_session):
-            raise SessionManagerError("finish or stop the running session before archiving")
+        if runtime_state(record.runtime_socket) == "running":
+            raise SessionManagerError("exit the running provider session before archiving")
         if record.provider == "codex":
             self.codex.archive(record.native_session_id)
         return self.registry.update(
@@ -252,7 +294,7 @@ class SessionManager:
         topic: str,
         role: str,
         native_name: str,
-        tmux_session: str | None,
+        runtime_socket: Path,
         *,
         repo: Path | None = None,
     ) -> dict[str, str]:
@@ -264,23 +306,9 @@ class SessionManager:
             "AGENTS_OWL_TOPIC": topic,
             "AGENTS_OWL_ROLE": role,
             "AGENTS_OWL_NATIVE_NAME": native_name,
+            "AGENTS_OWL_RUNTIME_SOCKET": str(runtime_socket),
         }
-        if tmux_session is not None:
-            environment["AGENTS_OWL_TMUX_SESSION"] = tmux_session
         return environment
-
-    def _wait_for_claude_record(self, tmux_name: str) -> SessionRecord | None:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            matches = [
-                record
-                for record in self.registry.find(repo=self.repo, include_archived=True)
-                if record.provider == "claude" and record.tmux_session == tmux_name
-            ]
-            if matches:
-                return matches[0]
-            time.sleep(0.1)
-        return None
 
     def _git_refs(self, repo: Path) -> list[str]:
         result = subprocess.run(
@@ -294,32 +322,13 @@ class SessionManager:
         return [value] if result.returncode == 0 and value else []
 
     @staticmethod
-    def _launch_direct(command: list[str], environment: dict[str, str], repo: Path) -> None:
-        SessionManager.require_direct_terminal()
-        selected_environment = os.environ.copy()
-        selected_environment.update(environment)
-        try:
-            os.chdir(repo)
-            os.execvpe(command[0], command, selected_environment)
-        except OSError as exc:
-            raise SessionManagerError(f"could not start {command[0]} directly: {exc}") from exc
-
-    @staticmethod
-    def require_direct_terminal() -> None:
-        if os.environ.get("TMUX"):
-            raise SessionManagerError(
-                "direct native UI was requested from inside tmux; detach or open a plain terminal, "
-                "then run the command again"
-            )
-
-    @staticmethod
-    def _inject(tmux_session: str, prompt: str) -> None:
-        try:
-            subprocess.run(["tmux", "set-buffer", "--", prompt], check=True)
-            subprocess.run(["tmux", "paste-buffer", "-t", tmux_session], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_session, "C-m"], check=True)
-        except subprocess.CalledProcessError as exc:
-            raise SessionManagerError(f"could not send command to {tmux_session}") from exc
+    def _launch_runtime(
+        runtime_socket: Path,
+        command: list[str],
+        environment: dict[str, str],
+        repo: Path,
+    ) -> None:
+        launch_runtime(runtime_socket, repo, command, environment)
 
 
 def handle_claude_hook(payload: dict[str, Any], environment: dict[str, str]) -> None:
@@ -359,7 +368,9 @@ def handle_claude_hook(payload: dict[str, Any], environment: dict[str, str]) -> 
         role=str(role),
         repo=str(Path(str(repo)).resolve()),
         lifecycle="active",
-        tmux_session=environment.get("AGENTS_OWL_TMUX_SESSION"),
+        runtime_socket=environment.get("AGENTS_OWL_RUNTIME_SOCKET") or (
+            existing.runtime_socket if existing else None
+        ),
         created_at=existing.created_at if existing else now_iso(),
         outcome=existing.outcome if existing else "",
         git_refs=existing.git_refs if existing else [],

@@ -22,11 +22,14 @@ from .registry import RegistryError, SessionRecord
 from .session_manager import (
     SessionManager,
     SessionManagerError,
-    attach_tmux,
+    attach_runtime,
     handle_claude_hook,
+    inject_runtime,
     install_claude_hooks,
-    make_tmux_name,
+    launch_runtime,
+    make_runtime_socket,
     runtime_lifecycle,
+    runtime_state,
 )
 
 
@@ -234,38 +237,27 @@ def session_name(pair: str, role: str) -> str:
     return f"owl-{validate_pair(pair)}-{ROLE_ALIASES[role]}"
 
 
-def tmux_has_session(session: str) -> bool:
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+def pair_runtime_socket(state_home: Path, repo: Path, pair: str, role: str) -> Path:
+    normalized_role = ROLE_ALIASES[role]
+    return make_runtime_socket(
+        state_home,
+        repo,
+        pair,
+        normalized_role,
+        discriminator=f"pair:{validate_pair(pair)}:{normalized_role}",
     )
-    return result.returncode == 0
 
 
-def require_tmux_target(target: str) -> None:
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise SystemExit("error: tmux is not installed or not on PATH") from exc
-    if result.returncode != 0:
-        raise SystemExit(f"error: tmux target does not exist: {target}")
+def require_runtime_target(target: str) -> None:
+    if runtime_state(target) != "running":
+        raise SystemExit(f"error: protected runtime is not running: {target}")
 
 
 def inject_prompt(target: str, prompt: str) -> None:
-    require_tmux_target(target)
     try:
-        subprocess.run(["tmux", "set-buffer", "--", prompt], check=True)
-        subprocess.run(["tmux", "paste-buffer", "-t", target], check=True)
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-m"], check=True)
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"error: tmux prompt injection failed for {target}") from exc
+        inject_runtime(target, prompt)
+    except SessionManagerError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def latest_artifacts(root: Path, kind: str | None = None, limit: int = 5) -> list[Path]:
@@ -314,10 +306,10 @@ def command_status(args: argparse.Namespace) -> None:
         print(f"  {path}")
     if not files:
         print("  none")
-    print("\ntmux sessions:")
+    print("\nprotected runtimes:")
     for role in ("worker", "peer"):
-        name = session_name(args.pair, role)
-        print(f"  {name}: {'exists' if tmux_has_session(name) else 'missing'}")
+        runtime_socket = pair_runtime_socket(state_home, repo, args.pair, role)
+        print(f"  {role}: {runtime_state(str(runtime_socket))} ({runtime_socket})")
     print(f"\nevents: {root / 'events.jsonl'}")
     print(f"decisions: {root / 'decisions.md'}")
 
@@ -327,8 +319,10 @@ def command_session(args: argparse.Namespace) -> None:
     root = initialize_pair(repo, state_home, args.pair)
     role = ROLE_ALIASES[args.role]
     session = session_name(args.pair, role)
-    if tmux_has_session(session):
-        os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+    runtime_socket = pair_runtime_socket(state_home, repo, args.pair, role)
+    if runtime_state(str(runtime_socket)) == "running":
+        attach_runtime(str(runtime_socket))
+        return
     default_cmd = "claude" if role == "worker" else "codex"
     legacy_env = "IMPLEMENTER_CMD" if role == "worker" else "REVIEWER_CMD"
     owl_env = "AGENTS_OWL_WORKER_CMD" if role == "worker" else "AGENTS_OWL_PEER_CMD"
@@ -346,21 +340,15 @@ def command_session(args: argparse.Namespace) -> None:
         f"printf 'handoff template: %s\\n\\n' {shlex.quote(str(role_template))}; "
         f"exec {agent_cmd}"
     )
-    try:
-        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", str(repo), startup], check=True)
-    except FileNotFoundError as exc:
-        raise SystemExit("error: tmux is not installed or not on PATH") from exc
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"error: could not create tmux session {session}") from exc
     append_event(root, args.pair, "session-start", role=role, session=session, command=agent_cmd)
-    os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+    launch_runtime(runtime_socket, repo, ["/bin/sh", "-lc", startup], {})
 
 
 def command_send_peer(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
     root, metadata = require_pair(repo, state_home, args.pair)
-    target = args.target or session_name(args.pair, "peer")
-    require_tmux_target(target)
+    target = args.target or str(pair_runtime_socket(state_home, repo, args.pair, "peer"))
+    require_runtime_target(target)
     artifact = archive_inbox(root, args.pair, "worker-handoff")
     prompt = template("peer-prompt.md").safe_substitute(
         pair=args.pair,
@@ -379,8 +367,8 @@ def command_send_peer(args: argparse.Namespace) -> None:
 def command_send_back(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
     root, metadata = require_pair(repo, state_home, args.pair)
-    target = args.target or session_name(args.pair, "worker")
-    require_tmux_target(target)
+    target = args.target or str(pair_runtime_socket(state_home, repo, args.pair, "worker"))
+    require_runtime_target(target)
     artifact = archive_inbox(root, args.pair, "peer-response")
     prompt = template("revision-prompt.md").safe_substitute(
         pair=args.pair,
@@ -521,8 +509,10 @@ def command_sessions(args: argparse.Namespace) -> None:
         actions.extend(["unarchive", "inspect"])
     else:
         if state != "running":
-            actions.extend(["resume-direct", "resume-tmux"])
-        actions.extend(["inspect", "finish", "rename", "archive"])
+            actions.append("resume")
+            actions.extend(["inspect", "finish", "rename", "archive"])
+        else:
+            actions.extend(["inspect", "rename"])
     actions = list(dict.fromkeys(actions))
     print("  ".join(f"{index}. {action}" for index, action in enumerate(actions, 1)))
     choice = input("Action [number, q]: ").strip()
@@ -536,17 +526,12 @@ def command_sessions(args: argparse.Namespace) -> None:
         raise SessionManagerError(f"invalid action: {choice}")
     action = actions[action_index - 1]
     if action == "attach":
-        if not selected.tmux_session:
-            raise SessionManagerError("session has no tmux runtime")
-        attach_tmux(selected.tmux_session)
-    if action == "resume-direct":
-        print(f"resuming {selected.key} directly", flush=True)
-        manager.resume(selected, use_tmux=False)
-    if action == "resume-tmux":
-        resumed = manager.resume(selected, use_tmux=True)
-        if not resumed.tmux_session:
-            raise SessionManagerError("session has no tmux runtime")
-        attach_tmux(resumed.tmux_session)
+        if not selected.runtime_socket:
+            raise SessionManagerError("session has no protected runtime")
+        attach_runtime(selected.runtime_socket)
+    if action == "resume":
+        print(f"resuming {selected.key} with disconnect protection", flush=True)
+        manager.resume(selected)
     if action == "inspect":
         print(json.dumps(record_value(selected), ensure_ascii=False, indent=2))
     if action == "finish":
@@ -577,56 +562,37 @@ def required_or_prompt(value: str | None, label: str) -> str:
 
 def command_session_new(args: argparse.Namespace) -> None:
     manager = session_manager(args)
-    if args.no_attach and not args.tmux:
-        raise SessionManagerError("--no-attach is only valid together with --tmux")
     provider = required_or_prompt(args.provider, "Provider (codex/claude)")
     topic = required_or_prompt(args.topic, "Topic")
     role = required_or_prompt(args.role, "Role (worker/peer)")
-    if not args.tmux:
-        manager.require_direct_terminal()
-    mode = "persistent tmux" if args.tmux else "direct native UI"
-    print(f"starting {provider} {role} in {mode}", flush=True)
-    record = manager.new(
+    print(f"starting protected {provider} {role} session", flush=True)
+    manager.new(
         provider=provider,
         topic=topic,
         role=role,
         native_name=args.name,
-        use_tmux=args.tmux,
     )
-    if not args.tmux:
-        return
-    if record is None:
-        tmux_name = make_tmux_name(manager.repo, topic, role)
-        print(f"started Claude session in {tmux_name}; native id registration is pending")
-        if not args.no_attach:
-            attach_tmux(tmux_name)
-        return
-    print(f"started {record.key}: {record.native_name}")
-    if not args.no_attach and record.tmux_session:
-        attach_tmux(record.tmux_session)
 
 
 def command_session_resume(args: argparse.Namespace) -> None:
     manager = session_manager(args)
-    if args.no_attach and not args.tmux:
-        raise SessionManagerError("--no-attach is only valid together with --tmux")
     record = resolve_managed_session(manager, args.selector, include_archived=False)
-    if not args.tmux:
-        manager.require_direct_terminal()
-    mode = "persistent tmux" if args.tmux else "direct native UI"
-    print(f"resuming {record.key} in {mode}", flush=True)
-    resumed = manager.resume(record, use_tmux=args.tmux)
-    if not args.tmux:
-        return
-    print(f"resumed {resumed.key}")
-    if not args.no_attach and resumed.tmux_session:
-        attach_tmux(resumed.tmux_session)
+    print(f"opening {record.key} with disconnect protection", flush=True)
+    manager.resume(record)
+
+
+def command_session_attach(args: argparse.Namespace) -> None:
+    manager = session_manager(args)
+    record = resolve_managed_session(manager, args.selector, include_archived=False)
+    if not record.runtime_socket:
+        raise SessionManagerError("session has no protected runtime")
+    attach_runtime(record.runtime_socket)
 
 
 def command_session_finish(args: argparse.Namespace) -> None:
     manager = session_manager(args)
     record = resolve_managed_session(manager, args.selector, include_archived=False)
-    completed = manager.finish(record, outcome=args.outcome, stop=args.stop)
+    completed = manager.finish(record, outcome=args.outcome)
     print(f"completed {completed.key}")
 
 
@@ -680,7 +646,7 @@ def command_hook_install_claude(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agents-owl",
-        description="Optional worker/peer collaboration without a mandatory review gate",
+        description="Disconnect-safe native agent sessions and optional worker/peer collaboration",
     )
     parser.add_argument("--repo", help="repository root; defaults to AGENTS_OWL_REPO or current Git root")
     parser.add_argument("--state-home", help="runtime state root; defaults to AGENTS_OWL_STATE_HOME or XDG state")
@@ -711,36 +677,19 @@ def build_parser() -> argparse.ArgumentParser:
     managed_new.add_argument("--topic")
     managed_new.add_argument("--role", choices=("worker", "peer"))
     managed_new.add_argument("--name", help="provider-native session name")
-    managed_new.add_argument(
-        "--tmux",
-        action="store_true",
-        help="run in persistent tmux instead of the direct native terminal",
-    )
-    managed_new.add_argument(
-        "--no-attach",
-        action="store_true",
-        help="with --tmux, leave the persistent runtime detached",
-    )
     managed_new.set_defaults(func=command_session_new)
 
     managed_resume = managed_sub.add_parser("resume", help="resume by native id, name, or index key")
     managed_resume.add_argument("selector", nargs="?")
-    managed_resume.add_argument(
-        "--tmux",
-        action="store_true",
-        help="run in persistent tmux instead of the direct native terminal",
-    )
-    managed_resume.add_argument(
-        "--no-attach",
-        action="store_true",
-        help="with --tmux, leave the persistent runtime detached",
-    )
     managed_resume.set_defaults(func=command_session_resume)
+
+    managed_attach = managed_sub.add_parser("attach", help="attach to a still-running protected session")
+    managed_attach.add_argument("selector", nargs="?")
+    managed_attach.set_defaults(func=command_session_attach)
 
     managed_finish = managed_sub.add_parser("finish", help="mark a topic session completed")
     managed_finish.add_argument("selector", nargs="?")
     managed_finish.add_argument("--outcome", default="")
-    managed_finish.add_argument("--stop", action="store_true", help="also stop its tmux runtime")
     managed_finish.set_defaults(func=command_session_finish)
 
     managed_rename = managed_sub.add_parser("rename", help="rename the provider-native session")
@@ -763,7 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     legacy_session = sub.add_parser(
         "pair-session",
-        help="compatibility command: create or attach a fixed worker/peer tmux session",
+        help="compatibility command: create or attach a fixed protected worker/peer session",
     )
     legacy_session.add_argument("pair")
     legacy_session.add_argument("role", choices=sorted(ROLE_ALIASES))
@@ -786,12 +735,12 @@ def build_parser() -> argparse.ArgumentParser:
     for command_name in ("send-peer", "send-review"):
         send_peer = sub.add_parser(command_name, help="archive worker handoff and request optional peer feedback")
         send_peer.add_argument("pair")
-        send_peer.add_argument("--target", help="tmux target; defaults to owl-<pair>-peer")
+        send_peer.add_argument("--target", help="runtime socket; defaults to the pair peer runtime")
         send_peer.set_defaults(func=command_send_peer)
 
     send_back = sub.add_parser("send-back", help="archive peer response and send bounded feedback to worker")
     send_back.add_argument("pair")
-    send_back.add_argument("--target", help="tmux target; defaults to owl-<pair>-worker")
+    send_back.add_argument("--target", help="runtime socket; defaults to the pair worker runtime")
     send_back.set_defaults(func=command_send_back)
 
     for command_name, kind in (
@@ -821,7 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-SESSION_ACTIONS = {"new", "resume", "finish", "rename", "inspect", "archive", "unarchive"}
+SESSION_ACTIONS = {"new", "resume", "attach", "finish", "rename", "inspect", "archive", "unarchive"}
 
 
 def normalize_argv(argv: list[str]) -> list[str]:

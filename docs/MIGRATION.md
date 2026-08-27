@@ -1,6 +1,6 @@
 # 从 Research Gate v0 迁移
 
-AgentsOwl 保留旧工具的 tmux、handoff、artifact 和事件日志能力，移除了
+AgentsOwl 保留旧工具的断线保护、handoff、artifact 和事件日志能力，移除了
 “双 AI 必须严格交叉验证并形成 gate”的治理假设。
 
 ## 概念映射
@@ -42,10 +42,10 @@ alias rgr="cd $PROJECT_REPO && $AGENTS_OWL_BIN sessions --role peer"
 
 实际 `.bashrc` 中应把 `$PROJECT_REPO` 和 `$AGENTS_OWL_BIN` 展开成完整路径，
 避免 alias 执行时变量不存在。v0.1 的 `session PAIR ROLE` 仍兼容，但只用于
-旧固定 pair tmux，不进入新的原生 session index。
+固定 pair runtime，不进入新的原生 session index。
 
-这些新 alias 默认进入 Claude/Codex 原生 TUI。需要断线存活时，在完整命令
-末尾显式加 `--tmux`；`--tmux --no-attach` 可只创建后台 runtime。
+这些 alias 默认进入由透明 PTY 保护的 Claude/Codex 原生 TUI。SSH 异常断开
+后重新执行 `pair`，选择 `running` 会话并 attach；不需要额外启动参数。
 
 ## 旧数据
 

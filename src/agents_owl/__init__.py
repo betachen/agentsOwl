@@ -1,3 +1,3 @@
 """Provider-native session management and optional two-agent collaboration."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

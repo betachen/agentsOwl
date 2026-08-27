@@ -1,8 +1,9 @@
 # AgentsOwl
 
-AgentsOwl 是一个 terminal-first 的 Codex/Claude Code 会话管理器，也保留
-可选的双 AI 协作工具。它直接索引 provider 自己的 session ID 和名称，把同
-一 topic 的 worker/peer 关联起来；不复制 transcript，不创建另一套会话身份。
+AgentsOwl 是一个 disconnect-safe 的 Codex/Claude Code 会话入口，也保留可选
+的双 AI 协作工具。它用透明的 `dtach` PTY 保护正在运行的 agent，避免 SSH 或
+终端异常断开杀死进程；同时直接索引 provider 自己的 session ID 和名称，不
+复制 transcript，不创建另一套会话身份。
 
 ## 原则
 
@@ -12,8 +13,10 @@ AgentsOwl 是一个 terminal-first 的 Codex/Claude Code 会话管理器，也�
 - worker 可以接受、推迟或有证据地拒绝可选建议；human-only 决策仍由
   human 作出。
 - runtime artifact 默认位于 `~/.local/state/agents-owl/`，不污染业务仓库。
-- 默认直接运行 provider 原生 TUI；tmux 只是显式可选的断线存活运行载体，
-  不是会话身份。
+- 所有 AgentsOwl 会话默认获得断线保护；`dtach` 只转发原始终端字节，不接管
+  provider TUI，也不是会话身份。
+- 正常退出完全遵循 Codex/Claude 原生语义；AgentsOwl 只处理异常断线后的
+  进程存活与重新连接。
 
 会话语义与完整命令见 [docs/SESSIONS.md](docs/SESSIONS.md)，可选双 AI 语义见
 [docs/WORKFLOW.md](docs/WORKFLOW.md)，从旧 Research Gate v0 迁移见
@@ -22,7 +25,7 @@ AgentsOwl 是一个 terminal-first 的 Codex/Claude Code 会话管理器，也�
 ## 依赖
 
 - Python 3.10+
-- tmux（可选，仅 `--tmux` 持久运行模式需要）
+- dtach 0.9+
 - Codex CLI 和/或 Claude Code
 
 工具只使用 Python 标准库。
@@ -33,23 +36,24 @@ AgentsOwl 是一个 terminal-first 的 Codex/Claude Code 会话管理器，也�
 git clone git@github.com:betachen/agentsOwl.git ~/workspace/agentsOwl
 chmod +x ~/workspace/agentsOwl/bin/agents-owl
 export PATH="$HOME/workspace/agentsOwl/bin:$PATH"
+sudo apt install dtach
 
 cd /path/to/project
 agents-owl hook install-claude --retention-days 3650  # 只需一次；保留已有 settings
 agents-owl session new --provider claude --role worker --topic '实现 E-021'
 ```
 
-默认命令直接进入 Claude/Codex 原生终端，不经过 tmux。只有预计 SSH 可能断线、
-且希望正在执行的推理继续运行时才显式使用：
+AgentsOwl 默认立即进入 Claude/Codex 原生 TUI。外层 `dtach` 没有窗口、状态栏
+或终端模拟层；它只在 SSH/terminal 突然消失时保住 agent：
 
 ```bash
-agents-owl session new --provider claude --role worker --topic '长任务' --tmux
-agents-owl session resume SESSION --tmux
+agents-owl session new --provider claude --role worker --topic '长任务'
 ```
 
-`--tmux` 默认创建持久 runtime 后 attach；再加 `--no-attach` 可留在后台。
-direct 命令必须从普通 shell 启动；若当前 shell 本身已经在 tmux 内，AgentsOwl
-会明确拒绝，避免把“未新建 tmux”误报成“原生终端”。
+正常使用时无需 detach 命令。若连接异常中断，重新登录后运行 `agents-owl
+sessions`，选择状态为 `running` 的会话并执行 `attach`。如果在 provider 内
+正常退出（Claude `/exit`、Codex `/quit`），agent 进程与保护 runtime 一起
+结束，原生 session 历史仍由 provider 管理。
 
 一个 topic 完成后标记完成；新 topic 新开原生会话：
 
@@ -70,6 +74,7 @@ app-server 创建和命名。恢复始终使用原生 ID：
 
 ```bash
 agents-owl session resume SESSION
+agents-owl session attach SESSION  # 只连接仍在运行的进程
 agents-owl session inspect SESSION --native  # --native 目前适用于 Codex
 agents-owl session archive SESSION
 agents-owl session unarchive SESSION
@@ -128,9 +133,10 @@ agents-owl decision my-project skip-peer --note 'Low-risk local change; project 
 
 ```text
 agents-owl sessions [--all] [--provider codex|claude] [--role worker|peer] [--json]
-agents-owl session new --provider PROVIDER --role ROLE --topic TOPIC [--name NAME] [--tmux]
-agents-owl session resume [SESSION] [--tmux]
-agents-owl session finish [SESSION] [--outcome TEXT] [--stop]
+agents-owl session new --provider PROVIDER --role ROLE --topic TOPIC [--name NAME]
+agents-owl session resume [SESSION]
+agents-owl session attach [SESSION]
+agents-owl session finish [SESSION] [--outcome TEXT]
 agents-owl session rename SESSION NAME
 agents-owl session inspect [SESSION] [--native]
 agents-owl session archive [SESSION]
@@ -167,6 +173,7 @@ AGENTS_OWL_WORKER_CMD
 AGENTS_OWL_PEER_CMD
 AGENTS_OWL_CODEX_CMD
 AGENTS_OWL_CLAUDE_CMD
+AGENTS_OWL_DTACH_CMD
 ```
 
 ## 测试
