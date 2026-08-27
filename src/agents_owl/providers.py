@@ -56,7 +56,7 @@ class CodexAppServer:
                     "clientInfo": {
                         "name": "agents_owl",
                         "title": "AgentsOwl",
-                        "version": "0.4.1",
+                        "version": "0.4.2",
                     }
                 },
             )

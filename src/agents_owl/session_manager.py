@@ -125,7 +125,7 @@ def attach_runtime(runtime_socket: str) -> None:
     if runtime_state(runtime_socket) != "running":
         raise SessionManagerError(f"runtime is not running: {runtime_socket}")
     dtach = require_dtach()
-    argv = [*dtach, "-a", runtime_socket, "-Ez", "-r", "winch"]
+    argv = [*dtach, "-a", runtime_socket, "-Ez", "-r", "ctrl_l"]
     try:
         os.execvp(argv[0], argv)
     except OSError as exc:

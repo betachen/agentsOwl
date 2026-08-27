@@ -12,6 +12,7 @@ from agents_owl.registry import RegistryError, SessionRecord, SessionRegistry
 from agents_owl.session_manager import (
     SessionManager,
     SessionManagerError,
+    attach_runtime,
     handle_claude_hook,
     install_claude_hooks,
     make_runtime_socket,
@@ -199,6 +200,16 @@ class SessionRegistryTests(unittest.TestCase):
             SessionManagerError, "still running"
         ):
             manager.finish(record)
+
+    def test_attach_forces_full_screen_redraw(self) -> None:
+        with patch("agents_owl.session_manager.runtime_state", return_value="running"), patch(
+            "agents_owl.session_manager.require_dtach", return_value=["dtach"]
+        ), patch("agents_owl.session_manager.os.execvp") as execute:
+            attach_runtime("/tmp/agent.sock")
+        execute.assert_called_once_with(
+            "dtach",
+            ["dtach", "-a", "/tmp/agent.sock", "-Ez", "-r", "ctrl_l"],
+        )
 
 
 if __name__ == "__main__":

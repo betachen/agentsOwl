@@ -97,7 +97,8 @@ agents-owl session attach SESSION
 ```
 
 `SESSION` 可以是完整索引键、原生 ID、唯一 ID 前缀或唯一原生名称。只有仍在
-运行的进程可以 attach。
+运行的进程可以 attach。重新连接时 AgentsOwl 会发送一次 `Ctrl-L`，强制
+Claude/Codex 重绘全屏 TUI；这不会提交输入或改变会话内容。
 
 如果 agent 已经正常退出，runtime socket 会自动消失，会话显示为 `exited`。
 此时使用 provider 原生 ID 恢复，但仍由 AgentsOwl 重新加上断线保护：
