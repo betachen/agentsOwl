@@ -99,6 +99,8 @@ Codex archive/unarchive 会同步原生状态；Claude 没有对称的外部 arc
 
 ## 可选 worker/peer 交接
 
+日常操作与故障排查见 [`send-peer` 快速使用说明](docs/SEND_PEER.md)。
+
 原 v0.1 的固定 pair 命令仍兼容。例如：
 
 ```bash
