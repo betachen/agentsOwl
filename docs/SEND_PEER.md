@@ -26,6 +26,11 @@ Peer 终端：
 ff session range-v01-r2 peer
 ```
 
+以后无需记住 pair 名即可重新进入：`ff i` 选择 worker，`ff r` 选择 peer。
+固定 pair 在列表中的 `kind` 是 `pair`；选择运行中的条目会直接 attach，选择
+已退出的条目会重新启动。`ff status` 不带名称时也会列出当前项目的 pair 供
+编号选择。
+
 Worker 写完 handoff 后，协调终端执行：
 
 ```bash
@@ -101,7 +106,8 @@ ff artifacts range-v01-r2
 
 1. Pair 名只能包含字母、数字、`_` 和 `-`。
 2. 推荐使用 `ff session PAIR worker|peer` 创建固定 pair；`ff impl/review`
-   创建的是另一类 topic session，默认不会被 `send-peer PAIR` 找到。
+   创建的是另一类 topic session。两类都会出现在 `ff i/r`，但只有固定 pair
+   能被 `send-peer PAIR` 直接寻址。
 3. 发送前确认 worker、peer 都是 `running`，并确认 peer 当前空闲。工具能判断
    runtime 是否存活，但不知道 AI 是否正在回答。
 4. Handoff 应是短摘要，只列路径、symbol、命令和结论。不要内嵌完整代码、
@@ -111,7 +117,7 @@ ff artifacts range-v01-r2
 6. 同一 peer session 会积累自身上下文。同一任务的小修订可以复用；新任务、
    跨模块任务或历史很长时应新建 pair/peer。
 7. Peer 结论只是建议，不是项目批准、否决或 human 决策。
-8. SSH 断开时 agent 由 `dtach` 保持运行；重新执行同一个
+8. 任务运行中按 `Ctrl+\` 可安全 detach 并返回 shell；重新执行同一个
    `ff session PAIR ROLE` 即可接入。正常 `/exit` 或 `/quit` 会结束 runtime。
 
 ## 常见错误

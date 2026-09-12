@@ -60,13 +60,25 @@ agents-owl hook install-claude --retention-days 3650
 
 ```bash
 ff                 # 全部会话
-ff i               # worker 列表
-ff r               # peer 列表
+ff i               # worker 列表；同时显示固定 pair，选择后进入
+ff r               # peer 列表；同时显示固定 pair，选择后进入
 ff impl [TOPIC]    # 新建 Claude worker
 ff review [TOPIC]  # 新建 Codex peer
 ```
 
 这些只是 AgentsOwl 内置子命令的短入口，不是 shell 中五套独立逻辑。
+
+`ff i` / `ff r` 会合并显示两类会话：`impl/review` 创建的 topic session，以及
+`session PAIR worker|peer` 创建的固定 pair runtime。表格中的 `kind` 列用于
+区分二者。选择正在运行的固定 pair 会直接 attach；选择已退出的固定 pair 会
+重新启动对应角色。
+
+查看 pair 状态时名称可以省略：
+
+```bash
+ff status       # 编号选择当前仓库的 pair
+ff status NAME  # 仍支持明确指定
+```
 
 新主题新会话：
 
@@ -80,8 +92,9 @@ agents-owl session new \
 参数缺失且当前是交互终端时会逐项询问。默认原生名称是
 `<topic> [<role>]`，也可以用 `--name` 指定。
 
-该命令直接 attach 到受保护的原生 TUI。`dtach` 的 detach 和 suspend 按键
-处理已禁用，键盘输入原样交给 provider；日常无需学习另一套快捷键。
+该命令直接 attach 到受保护的原生 TUI。按 `Ctrl+\` 使用 `dtach` 的默认
+detach 键返回当前 shell；agent 和正在运行的任务继续。`Ctrl+Z` suspend 处理
+仍禁用，其他键盘输入原样交给 provider。
 
 连接异常中断后：
 
@@ -146,6 +159,9 @@ agents-owl sessions --json
 - `missing`：已知原生对象在 provider 侧不可用。
 
 ## 正常退出与完成
+
+需要暂时离开但保留任务时按 `Ctrl+\`；重新连接后用 `session attach`。不要把
+detach 与 provider 退出混淆。
 
 正常退出仍使用 provider 自己的命令（Claude `/exit`、Codex `/quit`）。退出后
 agent 进程结束，`dtach` 自动移除 runtime socket；AgentsOwl 不改变、复制或

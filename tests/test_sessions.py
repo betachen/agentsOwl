@@ -15,6 +15,7 @@ from agents_owl.session_manager import (
     attach_runtime,
     handle_claude_hook,
     install_claude_hooks,
+    launch_runtime,
     make_runtime_socket,
     runtime_lifecycle,
     runtime_state,
@@ -208,8 +209,23 @@ class SessionRegistryTests(unittest.TestCase):
             attach_runtime("/tmp/agent.sock")
         execute.assert_called_once_with(
             "dtach",
-            ["dtach", "-a", "/tmp/agent.sock", "-Ez", "-r", "ctrl_l"],
+            ["dtach", "-a", "/tmp/agent.sock", "-z", "-r", "ctrl_l"],
         )
+
+    def test_launch_uses_default_dtach_detach_character(self) -> None:
+        socket_path = self.root / "launch.sock"
+        with patch("agents_owl.session_manager.require_dtach", return_value=["dtach"]), patch(
+            "agents_owl.session_manager.os.chdir"
+        ) as change_dir, patch("agents_owl.session_manager.os.execvpe") as execute:
+            launch_runtime(socket_path, self.repo, ["agent", "--flag"], {"EXAMPLE": "value"})
+
+        change_dir.assert_called_once_with(self.repo)
+        argv, environment = execute.call_args.args[1:]
+        self.assertEqual(
+            argv,
+            ["dtach", "-c", str(socket_path), "-z", "-r", "winch", "agent", "--flag"],
+        )
+        self.assertEqual(environment["EXAMPLE"], "value")
 
 
 if __name__ == "__main__":

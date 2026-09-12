@@ -35,8 +35,8 @@ Alchemist 根目录的 `.agents-owl.json` 只列出权威文件，不复制规�
 
 ```text
 ff          列出全部 Alchemist 会话，编号选择后执行 action
-ff i        只列 worker 会话
-ff r        只列 peer 会话
+ff i        只列 worker 会话（包含固定 pair）
+ff r        只列 peer 会话（包含固定 pair）
 ff impl     新建受断线保护的 Claude worker；交互输入本次 topic
 ff review   新建受断线保护的 Codex peer；输入相同 topic 即关联
 ```

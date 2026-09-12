@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from string import Template
@@ -54,6 +55,28 @@ KIND_ALIASES = {
     "reviewer-done": "peer-response",
 }
 DECISIONS = {"accept", "revise", "reject", "fork", "skip-peer"}
+
+
+@dataclass(frozen=True)
+class PairRuntimeRecord:
+    """A fixed pair runtime exposed alongside indexed topic sessions."""
+
+    pair: str
+    role: str
+    repo: Path
+    runtime_socket: str
+
+    @property
+    def provider(self) -> str:
+        return "claude" if self.role == "worker" else "codex"
+
+    @property
+    def native_name(self) -> str:
+        return session_name(self.pair, self.role)
+
+    @property
+    def state(self) -> str:
+        return runtime_state(self.runtime_socket)
 
 
 def now_iso() -> str:
@@ -181,6 +204,74 @@ def require_pair(repo: Path, state_home: Path, pair: str) -> tuple[Path, dict[st
     return root, metadata
 
 
+def initialized_pairs(state_home: Path, repo: Path | None = None) -> list[tuple[str, Path]]:
+    """Return initialized fixed pairs, optionally limited to one repository."""
+
+    pairs_dir = state_home / "pairs"
+    if not pairs_dir.is_dir():
+        return []
+    expected_repo = repo.resolve() if repo is not None else None
+    pairs: list[tuple[str, Path]] = []
+    for metadata_path in sorted(pairs_dir.glob("*/pair.json")):
+        metadata = read_json_object(metadata_path, "pair metadata")
+        pair = metadata.get("pair")
+        repo_value = metadata.get("repo")
+        if not isinstance(pair, str) or pair != metadata_path.parent.name:
+            raise SystemExit(f"error: invalid pair name in metadata: {metadata_path}")
+        validate_pair(pair)
+        if not isinstance(repo_value, str):
+            raise SystemExit(f"error: pair metadata repo must be a string: {metadata_path}")
+        pair_repo = Path(repo_value).expanduser().resolve()
+        if expected_repo is None or pair_repo == expected_repo:
+            pairs.append((pair, pair_repo))
+    return pairs
+
+
+def pair_runtime_records(
+    state_home: Path,
+    *,
+    repo: Path | None,
+    provider: str | None,
+    role: str | None,
+) -> list[PairRuntimeRecord]:
+    records: list[PairRuntimeRecord] = []
+    roles = (role,) if role else ("worker", "peer")
+    for pair, pair_repo in initialized_pairs(state_home, repo):
+        for selected_role in roles:
+            record = PairRuntimeRecord(
+                pair=pair,
+                role=selected_role,
+                repo=pair_repo,
+                runtime_socket=str(pair_runtime_socket(state_home, pair_repo, pair, selected_role)),
+            )
+            if provider is None or record.provider == provider:
+                records.append(record)
+    return records
+
+
+def choose_pair(repo: Path, state_home: Path) -> str:
+    pairs = initialized_pairs(state_home, repo)
+    if not pairs:
+        raise SessionManagerError(f"no initialized pairs for {repo}; run: agents-owl init PAIR")
+    print(f"{'#':>3}  {'pair':<28} {'worker':<10} peer")
+    for index, (pair, pair_repo) in enumerate(pairs, 1):
+        worker = runtime_state(str(pair_runtime_socket(state_home, pair_repo, pair, "worker")))
+        peer = runtime_state(str(pair_runtime_socket(state_home, pair_repo, pair, "peer")))
+        print(f"{index:>3}  {pair:<28} {worker:<10} {peer}")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise SessionManagerError("a pair selector is required outside an interactive terminal")
+    choice = input(f"Select pair [1-{len(pairs)}, q]: ").strip()
+    if choice.lower() == "q":
+        raise SystemExit(0)
+    try:
+        index = int(choice)
+    except ValueError as exc:
+        raise SessionManagerError(f"invalid selection: {choice}") from exc
+    if index < 1 or index > len(pairs):
+        raise SessionManagerError(f"selection out of range: {index}")
+    return pairs[index - 1][0]
+
+
 def append_event(root: Path, pair: str, event: str, **data: object) -> None:
     record = {"ts": now_iso(), "pair": pair, "event": event, **data}
     with (root / "events.jsonl").open("a", encoding="utf-8") as handle:
@@ -287,8 +378,9 @@ def command_init(args: argparse.Namespace) -> None:
 
 def command_status(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
-    root, metadata = require_pair(repo, state_home, args.pair)
-    print(f"pair: {args.pair}")
+    pair = args.pair or choose_pair(repo, state_home)
+    root, metadata = require_pair(repo, state_home, pair)
+    print(f"pair: {pair}")
     print(f"repo: {repo}")
     print(f"state: {root}")
     print("policy files:")
@@ -308,7 +400,7 @@ def command_status(args: argparse.Namespace) -> None:
         print("  none")
     print("\nprotected runtimes:")
     for role in ("worker", "peer"):
-        runtime_socket = pair_runtime_socket(state_home, repo, args.pair, role)
+        runtime_socket = pair_runtime_socket(state_home, repo, pair, role)
         print(f"  {role}: {runtime_state(str(runtime_socket))} ({runtime_socket})")
     print(f"\nevents: {root / 'events.jsonl'}")
     print(f"decisions: {root / 'decisions.md'}")
@@ -450,6 +542,50 @@ def print_session_table(records: list[SessionRecord]) -> None:
         )
 
 
+def print_openable_session_table(
+    records: list[SessionRecord], pair_records: list[PairRuntimeRecord]
+) -> None:
+    if not records and not pair_records:
+        print("no sessions")
+        return
+    print(f"{'#':>3}  {'state':<10} {'kind':<7} {'provider':<7} {'role':<6} {'topic/pair':<28} name")
+    index = 1
+    for record in records:
+        topic = record.topic if len(record.topic) <= 28 else f"{record.topic[:27]}…"
+        print(
+            f"{index:>3}  {runtime_lifecycle(record):<10} {'topic':<7} {record.provider:<7} "
+            f"{record.role:<6} {topic:<28} {record.native_name}"
+        )
+        index += 1
+    for record in pair_records:
+        pair = record.pair if len(record.pair) <= 28 else f"{record.pair[:27]}…"
+        print(
+            f"{index:>3}  {record.state:<10} {'pair':<7} {record.provider:<7} "
+            f"{record.role:<6} {pair:<28} {record.native_name}"
+        )
+        index += 1
+
+
+def choose_openable_session(
+    records: list[SessionRecord], pair_records: list[PairRuntimeRecord]
+) -> SessionRecord | PairRuntimeRecord:
+    choices: list[SessionRecord | PairRuntimeRecord] = [*records, *pair_records]
+    if not choices:
+        raise SessionManagerError("no matching sessions")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise SessionManagerError("a session selector is required outside an interactive terminal")
+    choice = input(f"Open [1-{len(choices)}, q]: ").strip()
+    if choice.lower() == "q":
+        raise SystemExit(0)
+    try:
+        index = int(choice)
+    except ValueError as exc:
+        raise SessionManagerError(f"invalid selection: {choice}") from exc
+    if index < 1 or index > len(choices):
+        raise SessionManagerError(f"selection out of range: {index}")
+    return choices[index - 1]
+
+
 def choose_record(
     records: list[SessionRecord], prompt: str = "Select session", *, show_table: bool = True
 ) -> SessionRecord:
@@ -499,10 +635,33 @@ def command_sessions(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps([record_value(record) for record in records], ensure_ascii=False, indent=2))
         return
-    print_session_table(records)
-    if args.no_select or not records or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    fixed_pairs = pair_runtime_records(
+        manager.state_home,
+        repo=repo_filter,
+        provider=args.provider,
+        role=args.role,
+    )
+    print_openable_session_table(records, fixed_pairs)
+    if args.no_select or (not records and not fixed_pairs) or not (
+        sys.stdin.isatty() and sys.stdout.isatty()
+    ):
         return
-    selected = choose_record(records, prompt="Open", show_table=False)
+    selected = choose_openable_session(records, fixed_pairs)
+    if isinstance(selected, PairRuntimeRecord):
+        if selected.state == "running":
+            attach_runtime(selected.runtime_socket)
+            return
+        print(f"starting fixed pair {selected.pair} {selected.role}", flush=True)
+        command_session(
+            argparse.Namespace(
+                repo=str(selected.repo),
+                state_home=str(manager.state_home),
+                pair=selected.pair,
+                role=selected.role,
+                command=None,
+            )
+        )
+        return
     state = runtime_lifecycle(selected)
     actions = ["attach"] if state == "running" else []
     if selected.lifecycle == "archived":
@@ -675,7 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(func=command_init)
 
     status = sub.add_parser("status", help="show pair state without creating it")
-    status.add_argument("pair")
+    status.add_argument("pair", nargs="?", help="pair name; omit to choose interactively")
     status.set_defaults(func=command_status)
 
     sessions = sub.add_parser("sessions", help="list and select native Codex/Claude sessions")

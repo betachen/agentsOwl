@@ -49,8 +49,8 @@ agents-owl session new --provider claude --role worker --topic '实现 E-021'
 alias ff='cd /path/to/project && /path/to/agentsOwl/bin/agents-owl'
 
 ff                 # 全部会话：列表 → 选择 → action
-ff i               # worker 会话
-ff r               # peer 会话
+ff i               # worker 会话（含固定 pair）：编号选择后进入
+ff r               # peer 会话（含固定 pair）：编号选择后进入
 ff impl             # 新建 Claude worker，交互输入 topic
 ff review           # 新建 Codex peer，交互输入 topic
 ff impl 'topic'     # 也可直接给 topic
@@ -58,16 +58,17 @@ ff review 'topic'
 ```
 
 AgentsOwl 默认立即进入 Claude/Codex 原生 TUI。外层 `dtach` 没有窗口、状态栏
-或终端模拟层；它只在 SSH/terminal 突然消失时保住 agent：
+或终端模拟层；它在 SSH/terminal 突然消失时保住 agent，也支持按 `Ctrl+\`
+主动 detach：
 
 ```bash
 agents-owl session new --provider claude --role worker --topic '长任务'
 ```
 
-正常使用时无需 detach 命令。若连接异常中断，重新登录后运行 `agents-owl
-sessions`，选择状态为 `running` 的会话并执行 `attach`。如果在 provider 内
-正常退出（Claude `/exit`、Codex `/quit`），agent 进程与保护 runtime 一起
-结束，原生 session 历史仍由 provider 管理。
+按 `Ctrl+\` 只退出当前连接并返回 shell，agent 和正在运行的任务继续；重新
+运行 `agents-owl sessions`，选择状态为 `running` 的会话并执行 `attach`。
+如果在 provider 内正常退出（Claude `/exit`、Codex `/quit`），agent 进程与
+保护 runtime 一起结束，原生 session 历史仍由 provider 管理。
 
 一个 topic 完成后标记完成；新 topic 新开原生会话：
 
@@ -106,6 +107,9 @@ Codex archive/unarchive 会同步原生状态；Claude 没有对称的外部 arc
 ```bash
 agents-owl init my-project
 agents-owl session my-project worker  # 兼容写法，等价于内部 pair-session
+agents-owl i                          # 选择该 pair 的 worker
+agents-owl r                          # 选择该 pair 的 peer
+agents-owl status                     # 不写名称时，编号选择当前项目的 pair
 ```
 
 worker 完成后写入 `agents-owl status my-project` 显示的
@@ -164,7 +168,7 @@ agents-owl session unarchive [SESSION]
 agents-owl hook install-claude
 
 agents-owl init PAIR
-agents-owl status PAIR
+agents-owl status [PAIR]
 agents-owl session PAIR worker|peer
 agents-owl send-peer PAIR
 agents-owl send-back PAIR

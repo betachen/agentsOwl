@@ -37,15 +37,15 @@ alias ff='cd /path/to/project && /path/to/agentsOwl/bin/agents-owl'
 
 ```text
 ff          → 全部 session 列表/选择器
-ff i        → worker session 列表/选择器
-ff r        → peer session 列表/选择器
+ff i        → worker session 与固定 pair 的合并列表/选择器
+ff r        → peer session 与固定 pair 的合并列表/选择器
 ff impl     → 新建 Claude worker
 ff review   → 新建 Codex peer
 ```
 
 实际 `.bashrc` 中使用完整路径，避免 alias 执行时变量不存在。v0.1 的
-`session PAIR ROLE` 仍兼容，但只用于固定 pair runtime，不进入新的原生
-session index。
+`session PAIR ROLE` 仍兼容；固定 pair runtime 不写入原生 session index，
+但会由 `ff` / `ff i` / `ff r` 的统一选择器发现。
 
 这些入口默认进入由透明 PTY 保护的 Claude/Codex 原生 TUI。SSH 异常断开
 后重新执行 `ff`，选择 `running` 会话并 attach；不需要额外启动参数。
