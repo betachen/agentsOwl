@@ -22,6 +22,7 @@ from .providers import (
     claude_resume_command,
 )
 from .registry import RegistryError, SessionRecord, SessionRegistry, now_iso
+from .runtime_redraw import attach_with_redraw
 
 
 class SessionManagerError(RuntimeError):
@@ -127,7 +128,10 @@ def attach_runtime(runtime_socket: str) -> None:
     dtach = require_dtach()
     argv = [*dtach, "-a", runtime_socket, "-z", "-r", "ctrl_l"]
     try:
-        os.execvp(argv[0], argv)
+        if os.isatty(0):
+            attach_with_redraw(argv, runtime_socket)
+        else:
+            os.execvp(argv[0], argv)
     except OSError as exc:
         raise SessionManagerError(f"could not attach runtime {runtime_socket}: {exc}") from exc
 

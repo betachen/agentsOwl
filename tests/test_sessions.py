@@ -205,11 +205,13 @@ class SessionRegistryTests(unittest.TestCase):
     def test_attach_forces_full_screen_redraw(self) -> None:
         with patch("agents_owl.session_manager.runtime_state", return_value="running"), patch(
             "agents_owl.session_manager.require_dtach", return_value=["dtach"]
-        ), patch("agents_owl.session_manager.os.execvp") as execute:
+        ), patch("agents_owl.session_manager.os.isatty", return_value=True), patch(
+            "agents_owl.session_manager.attach_with_redraw"
+        ) as execute:
             attach_runtime("/tmp/agent.sock")
         execute.assert_called_once_with(
-            "dtach",
             ["dtach", "-a", "/tmp/agent.sock", "-z", "-r", "ctrl_l"],
+            "/tmp/agent.sock",
         )
 
     def test_launch_uses_default_dtach_detach_character(self) -> None:
