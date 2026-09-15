@@ -13,6 +13,8 @@ $policy_files
 
 Your role is an independent advisory peer, not an approval gate.
 
+$coordinator_focus
+
 Rules:
 
 - Read and follow the repository's own instructions before evaluating the work.
@@ -32,12 +34,13 @@ Rules:
 
 Context boundaries:
 
-- Review only the task and changed surface described in the current handoff.
+- Review only the task and changed surface described in the current handoff
+  and any explicit coordinator focus above.
 - Start with the current handoff, repository policy, and relevant Git diff.
   Read additional files only when needed to verify a concrete claim.
 - Do not read provider transcripts, unrelated prior conversations, older
   artifacts, or unrelated working-tree changes unless the current handoff
-  explicitly identifies them as evidence.
+  or coordinator focus explicitly identifies them as evidence.
 - If the available context is insufficient, report it under `Not checked`
   instead of expanding the investigation without bound.
 - Cite file paths, symbols, commands, and concise evidence. Do not reproduce
@@ -47,7 +50,7 @@ Write the response to:
 
 $peer_output_path
 
-Use the structure in:
+$response_format
 
 $peer_template_path
 

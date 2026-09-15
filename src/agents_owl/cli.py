@@ -438,6 +438,9 @@ def command_session(args: argparse.Namespace) -> None:
 
 def command_send_peer(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
+    focus = args.focus.strip() if args.focus is not None else None
+    if focus == "":
+        raise SystemExit("error: --focus must contain a review question or requirement")
     root, metadata = require_pair(repo, state_home, args.pair)
     target = args.target or str(pair_runtime_socket(state_home, repo, args.pair, "peer"))
     require_runtime_target(target)
@@ -449,9 +452,32 @@ def command_send_peer(args: argparse.Namespace) -> None:
         peer_output_path=str(root / "inbox" / "peer-response.md"),
         peer_template_path=str(template_path("peer-response.md")),
         policy_files=policy_text(repo, metadata),
+        coordinator_focus=(
+            "## Coordinator's review questions and requirements\n\n"
+            "These requirements come from this send-peer invocation, separately from the worker handoff.\n"
+            "Use them to focus the review; repository policy remains authoritative.\n\n"
+            f"{focus}\n\n"
+            "## End of coordinator focus\n"
+            if focus else ""
+        ),
+        response_format=(
+            "Answer the coordinator's questions first, in their order, with a direct conclusion "
+            "and concise reasoning for each. Use the requested language and format.\n"
+            "Use the template below as a coverage checklist, not mandatory headings. "
+            "Omit irrelevant or empty sections and repetitive governance boilerplate.\n"
+            "Keep evidence near the claim it supports; prefer repository-relative paths where "
+            "unambiguous, and avoid a separate inventory of every file read.\n"
+            "State material uncertainty and anything not checked that affects the answers. "
+            "Mention other findings only if they materially affect the requested conclusions.\n"
+            "Reference checklist:"
+            if focus else "Use the structure in:"
+        ),
     )
     inject_prompt(target, prompt)
-    append_event(root, args.pair, "send-peer", artifact=str(artifact), target=target)
+    append_event(
+        root, args.pair, "send-peer", artifact=str(artifact), target=target,
+        **({"focus": focus} if focus else {}),
+    )
     print(f"sent optional peer request to {target}")
     print(f"archived worker handoff: {artifact}")
 
@@ -908,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
         send_peer = sub.add_parser(command_name, help="archive worker handoff and request optional peer feedback")
         send_peer.add_argument("pair")
         send_peer.add_argument("--target", help="runtime socket; defaults to the pair peer runtime")
+        send_peer.add_argument("--focus", help="review questions or requirements; answer these before generic findings")
         send_peer.set_defaults(func=command_send_peer)
 
     send_back = sub.add_parser("send-back", help="archive peer response and send bounded feedback to worker")

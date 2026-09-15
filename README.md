@@ -170,7 +170,7 @@ agents-owl hook install-claude
 agents-owl init PAIR
 agents-owl status [PAIR]
 agents-owl session PAIR worker|peer
-agents-owl send-peer PAIR
+agents-owl send-peer PAIR [--focus 'Review questions and requirements']
 agents-owl send-back PAIR
 agents-owl archive-worker PAIR
 agents-owl archive-peer PAIR
