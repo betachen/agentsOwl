@@ -46,7 +46,7 @@ agents-owl session new --provider claude --role worker --topic '实现 E-021'
 可选的单 alias 入口：
 
 ```bash
-alias ff='cd /path/to/project && /path/to/agentsOwl/bin/agents-owl'
+alias ff='/path/to/agentsOwl/bin/agents-owl'
 
 ff                 # 全部会话：列表 → 选择 → action
 ff i               # worker 会话（含固定 pair）：编号选择后进入
@@ -55,7 +55,20 @@ ff impl             # 新建 Claude worker，交互输入 topic
 ff review           # 新建 Codex peer，交互输入 topic
 ff impl 'topic'     # 也可直接给 topic
 ff review 'topic'
+ff solo claude     # 当前目录的独立 Claude；不需要 pair/topic
+ff solo codex      # 当前目录的独立 Codex
 ```
+
+轻量任务直接使用 `ff solo claude` 或 `ff solo codex`。它以当前目录（不是
+Git 根目录）为工作环境，不读取 `.agents-owl.json`、不注入 worker/peer
+模板、不自动恢复历史对话，也不进入协作会话索引。agent 仍读取其自身的全局
+设置和当前项目适用的规则；solo 不会禁用这些规则。
+
+按 `Ctrl+\` 脱离后，在同一目录重复同一命令即可接回仍运行的 agent。
+不同目录和不同 provider 相互独立。若要在同一目录并行处理另一件事，使用
+`ff solo claude --name another-task`，之后用同一名称接回。正常退出 agent
+后，再执行该命令会启动新对话；solo 不负责恢复已结束对话的历史。
+更多说明见 [Solo 模式](docs/SOLO.md)。
 
 AgentsOwl 默认立即进入 Claude/Codex 原生 TUI。外层 `dtach` 没有窗口、状态栏
 或终端模拟层；它在 SSH/terminal 突然消失时保住 agent，也支持按 `Ctrl+\`
@@ -168,6 +181,7 @@ agents-owl session unarchive [SESSION]
 agents-owl hook install-claude
 
 agents-owl init PAIR
+agents-owl solo claude|codex [--name NAME]
 agents-owl status [PAIR]
 agents-owl session PAIR worker|peer
 agents-owl send-peer PAIR [--focus 'Review questions and requirements']

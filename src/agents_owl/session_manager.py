@@ -109,10 +109,14 @@ def launch_runtime(
     repo: Path,
     command: list[str],
     environment: dict[str, str],
+    *,
+    remove_environment: tuple[str, ...] = (),
 ) -> None:
     dtach = require_dtach()
     _prepare_runtime_socket(runtime_socket)
     selected_environment = os.environ.copy()
+    for name in remove_environment:
+        selected_environment.pop(name, None)
     selected_environment.update(environment)
     argv = [*dtach, "-c", str(runtime_socket), "-z", "-r", "winch", *command]
     try:

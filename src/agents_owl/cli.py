@@ -436,6 +436,37 @@ def command_session(args: argparse.Namespace) -> None:
     launch_runtime(runtime_socket, repo, ["/bin/sh", "-lc", startup], {})
 
 
+def command_solo(args: argparse.Namespace) -> None:
+    # Solo follows the exact working directory, not the Git root or an inherited
+    # AGENTS_OWL_REPO from a worker/peer session. An explicit --repo still wins.
+    repo = Path(args.repo).expanduser().resolve() if args.repo else Path.cwd().resolve()
+    if not repo.is_dir():
+        raise SessionManagerError(f"working directory does not exist: {repo}")
+    state_home = resolve_state_home(args.state_home)
+    name = args.name.strip()
+    if not name:
+        raise SessionManagerError("solo session name must not be empty")
+    runtime_socket = make_runtime_socket(
+        state_home, repo, name, "solo", discriminator=f"solo:{args.provider}:{name}"
+    )
+    if runtime_state(str(runtime_socket)) == "running":
+        print(f"attaching solo {args.provider} ({name}) in {repo}", flush=True)
+        attach_runtime(str(runtime_socket))
+        return
+    print(f"starting solo {args.provider} ({name}) in {repo}", flush=True)
+    print("Ctrl+\\ to detach; repeat this command to reconnect.", flush=True)
+    # Do not inherit managed-session hooks/roles or collaboration context. The
+    # normal provider executable handles its own settings and project rules.
+    inherited_context = tuple(
+        key for key in os.environ
+        if key.startswith("AGENTS_OWL_") or key in {"IMPLEMENTER_CMD", "REVIEWER_CMD"}
+    )
+    launch_runtime(
+        runtime_socket, repo, [args.provider], {"PWD": str(repo)},
+        remove_environment=inherited_context,
+    )
+
+
 def command_send_peer(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
     focus = args.focus.strip() if args.focus is not None else None
@@ -836,6 +867,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", help="repository root; defaults to AGENTS_OWL_REPO or current Git root")
     parser.add_argument("--state-home", help="runtime state root; defaults to AGENTS_OWL_STATE_HOME or XDG state")
     sub = parser.add_subparsers(dest="command_name", required=True)
+
+    solo = sub.add_parser("solo", help="start or reconnect an independent agent in the current directory")
+    solo.add_argument("provider", choices=("claude", "codex"))
+    solo.add_argument("--name", default="default", help="independent task slot; defaults to default")
+    solo.set_defaults(func=command_solo)
 
     impl = sub.add_parser("impl", help="start a Claude worker session")
     impl.add_argument("topic", nargs="?")
