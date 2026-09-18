@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from agents_owl.cli import (
     initialize_pair,
     initialized_pairs,
     latest_artifacts,
+    normalize_argv,
     pair_runtime_socket,
     policy_text,
     project_config,
@@ -102,6 +104,62 @@ class AgentsOwlTests(unittest.TestCase):
             command_sessions(args)
 
         attach.assert_called_once_with(expected_socket)
+
+    def pair_session(self, role: str, *options: str) -> tuple[str, dict[str, object]]:
+        args = build_parser().parse_args(normalize_argv([
+            "--repo", str(self.repo), "--state-home", str(self.state),
+            "session", "demo", role, *options,
+        ]))
+        with patch("agents_owl.cli.launch_runtime") as launch:
+            args.func(args)
+        startup = launch.call_args.args[2][-1]
+        root = self.state / "pairs" / "demo"
+        event = json.loads((root / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        return startup.split("; exec ", 1)[1], event
+
+    def test_restarted_claude_pair_resumes_the_same_native_session(self) -> None:
+        claude_home = self.root / "claude-home"
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_home)}):
+            os.environ.pop("AGENTS_OWL_WORKER_CMD", None)
+            os.environ.pop("IMPLEMENTER_CMD", None)
+            first, event = self.pair_session("worker")
+            native_id = event["native_session_id"]
+            self.assertEqual(first, f"claude --session-id {native_id} --name owl-demo-worker")
+            self.assertFalse(event["resumed"])
+
+            # Exited before any message: no transcript, so reuse the id as a new session.
+            again, _ = self.pair_session("worker")
+            self.assertEqual(again, first)
+
+            transcript = claude_home / "projects" / "-repo" / f"{native_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            resumed, event = self.pair_session("worker")
+            self.assertEqual(resumed, f"claude --resume {native_id}")
+            self.assertTrue(event["resumed"])
+
+            fresh, event = self.pair_session("worker", "--fresh")
+            self.assertNotEqual(event["native_session_id"], native_id)
+            self.assertIn("--session-id", fresh)
+
+    def test_restarted_codex_pair_resumes_the_same_thread(self) -> None:
+        with patch.dict(os.environ, {}, clear=False), patch("agents_owl.cli.CodexProvider") as provider:
+            os.environ.pop("AGENTS_OWL_PEER_CMD", None)
+            os.environ.pop("REVIEWER_CMD", None)
+            provider.return_value.create.return_value = {"id": "thread-1"}
+            first, event = self.pair_session("peer")
+            second, _ = self.pair_session("peer")
+        self.assertEqual(first, "codex resume thread-1")
+        self.assertEqual(second, first)
+        self.assertEqual(provider.return_value.create.call_count, 1)
+        provider.return_value.create.assert_called_once_with(self.repo, "owl-demo-peer")
+
+    def test_custom_pair_command_is_not_rewritten(self) -> None:
+        for command in ("my-agent --flag", "claude --resume abc", "codex exec 'hi'"):
+            with self.subTest(command=command):
+                startup, event = self.pair_session("worker", "--command", command)
+                self.assertEqual(startup, command)
+                self.assertNotIn("native_session_id", event)
 
     def test_archive_consumes_inbox_and_records_hash(self) -> None:
         root = initialize_pair(self.repo, self.state, "demo")

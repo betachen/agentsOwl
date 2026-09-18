@@ -70,8 +70,24 @@ ff review [TOPIC]  # 新建 Codex peer
 
 `ff i` / `ff r` 会合并显示两类会话：`impl/review` 创建的 topic session，以及
 `session PAIR worker|peer` 创建的固定 pair runtime。表格中的 `kind` 列用于
-区分二者。选择正在运行的固定 pair 会直接 attach；选择已退出的固定 pair 会
-重新启动对应角色。
+区分二者。选择正在运行的固定 pair 会直接 attach；选择已退出的固定 pair
+（例如用 `Ctrl+D`、`/exit` 退出后）会恢复该角色原来的 provider 原生会话，
+上下文保持不变：
+
+- Claude：首次启动用 `--session-id` 固定 ID，之后用 `claude --resume <id>`；
+  如果上次没有产生任何对话（无 transcript），沿用同一 ID 重新开始。
+- Codex：首次启动时通过 app-server 创建命名 thread，之后 `codex resume <id>`。
+
+绑定关系保存在 `pairs/<PAIR>/native-sessions.json`。需要为某个角色开启全新
+对话时：
+
+```bash
+agents-owl session PAIR worker --fresh
+```
+
+`--command` 或 `AGENTS_OWL_WORKER_CMD`/`AGENTS_OWL_PEER_CMD` 指定的自定义
+命令（非 `claude`/`codex`，或已自带 `--resume`、`resume` 等会话选择参数）
+保持原样执行，不做绑定。
 
 查看 pair 状态时名称可以省略：
 

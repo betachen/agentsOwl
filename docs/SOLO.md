@@ -24,8 +24,18 @@ ff solo claude --name explore
 ff solo codex --name quick-fix
 ```
 
-每条命令都是独立会话，重连时使用相同命令。正常退出 agent 会结束对应 runtime；
-下次使用该命令会开启新对话，不自动 resume 历史。
+每条命令都是独立会话，重连时使用相同命令。正常退出 agent（`Ctrl+D`、
+`/exit`、`/quit`）会结束对应 runtime；下次使用同一命令会恢复同一个 provider
+原生对话（Claude `--resume <id>`、Codex `resume <id>`），上下文保持不变。
+如果上次没有产生任何对话，Claude 沿用同一 ID 重新开始。
+
+需要为同一名称开启全新对话时：
+
+```bash
+ff solo claude --fresh
+```
+
+`--fresh` 只在 runtime 未运行时生效；运行中的会话仍直接重连。
 
 solo 会话通过 `ff solo ...` 接回，不出现在 worker/peer 的 `ff i/r` 列表。
 
@@ -37,6 +47,7 @@ solo 会话通过 `ff solo ...` 接回，不出现在 worker/peer 的 `ff i/r` �
 - 启动时移除继承的 `AGENTS_OWL_*` 协作变量与旧 worker/peer 命令变量，避免误登记为 managed session。
 - 正常保留 provider 的全局设置、认证环境及适用于当前目录的项目规则。solo 不是配置隔离或文件访问沙箱。
 - runtime socket 位于 AgentsOwl state 目录，默认是 `~/.local/state/agents-owl/runtimes/`，不在任务目录生成额外文件。
+- “目录 + provider + 名称” 与原生会话 ID 的绑定保存在 `~/.local/state/agents-owl/solo/native-sessions.json`。
 
 `ff` 的 alias 应直接指向工具，不要带固定项目的 `cd`：
 

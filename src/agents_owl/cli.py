@@ -12,17 +12,19 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from string import Template
 from typing import Any
 
-from .providers import ProviderError
+from .providers import CodexProvider, ProviderError
 from .registry import RegistryError, SessionRecord
 from .session_manager import (
     SessionManager,
     SessionManagerError,
+    _atomic_json_write,
     attach_runtime,
     handle_claude_hook,
     inject_runtime,
@@ -419,6 +421,12 @@ def command_session(args: argparse.Namespace) -> None:
     legacy_env = "IMPLEMENTER_CMD" if role == "worker" else "REVIEWER_CMD"
     owl_env = "AGENTS_OWL_WORKER_CMD" if role == "worker" else "AGENTS_OWL_PEER_CMD"
     agent_cmd = args.command or os.environ.get(owl_env) or os.environ.get(legacy_env) or default_cmd
+    extra, native_id, resumed = native_session_args(
+        root / "native-sessions.json", role, repo, session, agent_cmd,
+        fresh=getattr(args, "fresh", False),
+    )
+    if extra:
+        agent_cmd = f"{agent_cmd} {shlex.join(extra)}"
     output_name = "worker-handoff.md" if role == "worker" else "peer-response.md"
     output_path = root / "inbox" / output_name
     role_template = template_path(output_name)
@@ -432,8 +440,67 @@ def command_session(args: argparse.Namespace) -> None:
         f"printf 'handoff template: %s\\n\\n' {shlex.quote(str(role_template))}; "
         f"exec {agent_cmd}"
     )
-    append_event(root, args.pair, "session-start", role=role, session=session, command=agent_cmd)
+    event: dict[str, object] = {"role": role, "session": session, "command": agent_cmd}
+    if native_id:
+        event.update(native_session_id=native_id, resumed=resumed)
+    append_event(root, args.pair, "session-start", **event)
     launch_runtime(runtime_socket, repo, ["/bin/sh", "-lc", startup], {})
+
+
+CLAUDE_SESSION_FLAGS = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session"}
+
+
+def claude_transcript_exists(native_session_id: str) -> bool:
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    return any((config_dir / "projects").glob(f"*/{native_session_id}.jsonl"))
+
+
+def native_session_args(
+    path: Path, key: str, repo: Path, native_name: str, agent_cmd: str, *, fresh: bool = False
+) -> tuple[list[str], str | None, bool]:
+    """Bind one pair role or solo slot to a provider-native session across restarts.
+
+    Returns the arguments to append to ``agent_cmd``, the native session id
+    (None for custom commands) and whether an existing conversation is resumed.
+    """
+    try:
+        tokens = shlex.split(agent_cmd)
+    except ValueError:
+        return [], None, False
+    provider = Path(tokens[0]).name if tokens else ""
+    # Custom commands and explicit session selection (e.g. `claude --resume X`,
+    # `codex resume X`, `codex exec`) stay untouched.
+    if provider == "claude":
+        supported = CLAUDE_SESSION_FLAGS.isdisjoint(tokens)
+    elif provider == "codex":
+        supported = all(token.startswith("-") or "=" in token for token in tokens[1:])
+    else:
+        supported = False
+    if not supported:
+        return [], None, False
+    sessions = read_json_object(path, "native session bindings") if path.is_file() else {}
+    stored = sessions.get(key)
+    native_id = None
+    if not fresh and isinstance(stored, dict) and stored.get("provider") == provider:
+        value = stored.get("native_session_id")
+        native_id = value if isinstance(value, str) and value else None
+    if provider == "claude":
+        resumed = native_id is not None and claude_transcript_exists(native_id)
+        native_id = native_id or str(uuid.uuid4())
+        extra = ["--resume", native_id] if resumed else ["--session-id", native_id, "--name", native_name]
+    else:
+        resumed = native_id is not None
+        if native_id is None:
+            thread = CodexProvider(tokens).create(repo, native_name)
+            created = thread.get("sessionId") or thread.get("id")
+            if not isinstance(created, str) or not created:
+                raise SessionManagerError("Codex did not return a native session id")
+            native_id = created
+        extra = ["resume", native_id]
+    if not isinstance(stored, dict) or stored.get("native_session_id") != native_id:
+        sessions[key] = {"provider": provider, "native_session_id": native_id, "created_at": now_iso()}
+        _atomic_json_write(path, sessions)
+    return extra, native_id, resumed
 
 
 def command_solo(args: argparse.Namespace) -> None:
@@ -453,7 +520,13 @@ def command_solo(args: argparse.Namespace) -> None:
         print(f"attaching solo {args.provider} ({name}) in {repo}", flush=True)
         attach_runtime(str(runtime_socket))
         return
-    print(f"starting solo {args.provider} ({name}) in {repo}", flush=True)
+    # Same directory + provider + name means the same native conversation.
+    bindings = state_home / "solo" / "native-sessions.json"
+    extra, _, resumed = native_session_args(
+        bindings, f"{repo}::{args.provider}::{name}", repo, f"solo {name}", args.provider,
+        fresh=args.fresh,
+    )
+    print(f"{'resuming' if resumed else 'starting'} solo {args.provider} ({name}) in {repo}", flush=True)
     print("Ctrl+\\ to detach; repeat this command to reconnect.", flush=True)
     # Do not inherit managed-session hooks/roles or collaboration context. The
     # normal provider executable handles its own settings and project rules.
@@ -462,7 +535,7 @@ def command_solo(args: argparse.Namespace) -> None:
         if key.startswith("AGENTS_OWL_") or key in {"IMPLEMENTER_CMD", "REVIEWER_CMD"}
     )
     launch_runtime(
-        runtime_socket, repo, [args.provider], {"PWD": str(repo)},
+        runtime_socket, repo, [args.provider, *extra], {"PWD": str(repo)},
         remove_environment=inherited_context,
     )
 
@@ -708,7 +781,7 @@ def command_sessions(args: argparse.Namespace) -> None:
         if selected.state == "running":
             attach_runtime(selected.runtime_socket)
             return
-        print(f"starting fixed pair {selected.pair} {selected.role}", flush=True)
+        print(f"opening fixed pair {selected.pair} {selected.role}", flush=True)
         command_session(
             argparse.Namespace(
                 repo=str(selected.repo),
@@ -716,6 +789,7 @@ def command_sessions(args: argparse.Namespace) -> None:
                 pair=selected.pair,
                 role=selected.role,
                 command=None,
+                fresh=False,
             )
         )
         return
@@ -871,6 +945,11 @@ def build_parser() -> argparse.ArgumentParser:
     solo = sub.add_parser("solo", help="start or reconnect an independent agent in the current directory")
     solo.add_argument("provider", choices=("claude", "codex"))
     solo.add_argument("--name", default="default", help="independent task slot; defaults to default")
+    solo.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start a new provider conversation instead of resuming this slot's previous one",
+    )
     solo.set_defaults(func=command_solo)
 
     impl = sub.add_parser("impl", help="start a Claude worker session")
@@ -951,6 +1030,11 @@ def build_parser() -> argparse.ArgumentParser:
     legacy_session.add_argument("pair")
     legacy_session.add_argument("role", choices=sorted(ROLE_ALIASES))
     legacy_session.add_argument("--command", help="agent command; defaults to claude for worker and codex for peer")
+    legacy_session.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start a new provider conversation instead of resuming the pair role's previous one",
+    )
     legacy_session.set_defaults(func=command_session)
 
     hook = sub.add_parser("hook", help="Claude lifecycle hook integration")

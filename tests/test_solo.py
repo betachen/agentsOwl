@@ -19,6 +19,14 @@ class SoloTests(unittest.TestCase):
         self.work.mkdir(parents=True)
         (self.work.parent / ".git").mkdir()
         self.state = self.root / "state"
+        self.claude_home = self.root / "claude-home"
+        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.claude_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        codex = patch("agents_owl.cli.CodexProvider")
+        self.codex = codex.start()
+        self.addCleanup(codex.stop)
+        self.codex.return_value.create.return_value = {"id": "codex-thread"}
 
     def args(self, provider: str = "claude", *options: str):
         return build_parser().parse_args([
@@ -44,11 +52,12 @@ class SoloTests(unittest.TestCase):
                 args.func(args)
             runtime_socket, cwd, command, environment = launch.call_args.args
             self.assertEqual(cwd, self.work)
-            self.assertEqual(command, [provider])
+            self.assertEqual(command[0], provider)
             self.assertEqual(environment, {"PWD": str(self.work)})
             self.assertEqual(runtime_socket.parent, self.state / "runtimes")
             self.assertTrue(set(inherited).issubset(launch.call_args.kwargs["remove_environment"]))
         self.assertEqual(list(self.work.iterdir()), [])
+        self.codex.return_value.create.assert_called_once_with(self.work, "solo default")
         self.assertFalse((self.state / "pairs").exists())
         self.assertFalse((self.state / "sessions").exists())
 
@@ -67,6 +76,36 @@ class SoloTests(unittest.TestCase):
             args.func(args)
         attach.assert_called_once_with(str(runtime_socket))
         launch.assert_not_called()
+
+    def launched_command(self, provider: str, *options: str) -> list[str]:
+        args = self.args(provider, *options)
+        with patch("agents_owl.cli.Path.cwd", return_value=self.work), patch(
+            "agents_owl.cli.launch_runtime"
+        ) as launch:
+            args.func(args)
+        return launch.call_args.args[2]
+
+    def test_restarted_claude_solo_resumes_the_same_conversation(self) -> None:
+        first = self.launched_command("claude")
+        self.assertEqual(first[:2], ["claude", "--session-id"])
+        native_id = first[2]
+        self.assertEqual(first[3:], ["--name", "solo default"])
+
+        transcript = self.claude_home / "projects" / "-work" / f"{native_id}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n", encoding="utf-8")
+        self.assertEqual(self.launched_command("claude"), ["claude", "--resume", native_id])
+
+        other = self.launched_command("claude", "--name", "other")
+        self.assertNotEqual(other[2], native_id)
+        fresh = self.launched_command("claude", "--fresh")
+        self.assertEqual(fresh[1], "--session-id")
+        self.assertNotEqual(fresh[2], native_id)
+
+    def test_restarted_codex_solo_resumes_the_same_thread(self) -> None:
+        self.assertEqual(self.launched_command("codex"), ["codex", "resume", "codex-thread"])
+        self.assertEqual(self.launched_command("codex"), ["codex", "resume", "codex-thread"])
+        self.codex.return_value.create.assert_called_once()
 
     def test_directory_provider_and_name_have_independent_runtimes(self) -> None:
         sockets = []
