@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +21,7 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from .providers import CodexProvider, ProviderError
+from .providers import ProviderError
 from .registry import RegistryError, SessionRecord
 from .session_manager import (
     SessionManager,
@@ -341,9 +343,144 @@ def pair_runtime_socket(state_home: Path, repo: Path, pair: str, role: str) -> P
     )
 
 
+def pair_native_session_id(state_home: Path, pair: str, role: str) -> str | None:
+    path = pair_root(state_home, pair) / "native-sessions.json"
+    if not path.is_file():
+        return None
+    bindings = read_json_object(path, "native session bindings")
+    value = bindings.get(ROLE_ALIASES[role])
+    if not isinstance(value, dict):
+        return None
+    native_id = value.get("native_session_id")
+    return native_id if isinstance(native_id, str) and native_id else None
+
+
 def require_runtime_target(target: str) -> None:
     if runtime_state(target) != "running":
         raise SystemExit(f"error: protected runtime is not running: {target}")
+
+
+def _proc_cmdline(pid: int) -> list[str]:
+    try:
+        values = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        return []
+    return [os.fsdecode(value) for value in values if value]
+
+
+def _proc_ppid(pid: int) -> int | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _runtime_codex_pid(runtime_socket: str) -> int | None:
+    """Find the Codex process owned by one of our dtach servers."""
+
+    server_pid: int | None = None
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        command = _proc_cmdline(pid)
+        if not command or Path(command[0]).name != "dtach":
+            continue
+        if "-c" not in command:
+            continue
+        try:
+            socket_index = command.index("-c") + 1
+        except ValueError:
+            continue
+        if socket_index < len(command) and command[socket_index] == runtime_socket:
+            server_pid = pid
+            break
+    if server_pid is None:
+        return None
+
+    pending = [server_pid]
+    while pending:
+        parent = pending.pop()
+        for entry in Path("/proc").glob("[0-9]*"):
+            try:
+                pid = int(entry.name)
+            except ValueError:
+                continue
+            if _proc_ppid(pid) != parent:
+                continue
+            command = _proc_cmdline(pid)
+            if command and Path(command[0]).name == "codex":
+                return pid
+            pending.append(pid)
+    return None
+
+
+def replay_idle_codex_runtime(runtime_socket: str) -> bool:
+    """Stop an idle Codex child so the same session can redraw on resume.
+
+    Sending ``/quit`` through dtach is unreliable when Codex is in its transcript
+    pager or alternate screen. Killing only the idle Codex child leaves the
+    rollout intact; the dtach shell then exits and can be relaunched normally.
+    """
+
+    pid = _runtime_codex_pid(runtime_socket)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if runtime_state(runtime_socket) != "running":
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if runtime_state(runtime_socket) != "running":
+            return True
+        time.sleep(0.05)
+    return runtime_state(runtime_socket) != "running"
+
+
+def codex_runtime_ready(runtime_socket: str, native_session_id: str) -> bool:
+    """Return whether Codex has written startup state for this runtime."""
+
+    pid = _runtime_codex_pid(runtime_socket)
+    if pid is None:
+        return False
+    try:
+        started_ns = Path(f"/proc/{pid}").stat().st_ctime_ns
+    except OSError:
+        return False
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    sessions = codex_home / "sessions"
+    try:
+        paths = list(sessions.rglob(f"*{native_session_id}.jsonl"))
+        return any(path.stat().st_mtime_ns >= started_ns for path in paths)
+    except OSError:
+        return False
+
+
+def wait_for_codex_runtime(runtime_socket: str, native_session_id: str, timeout: float = 45.0) -> bool:
+    """Wait for a resumed Codex TUI to finish its startup handshake."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if runtime_state(runtime_socket) != "running":
+            return False
+        if codex_runtime_ready(runtime_socket, native_session_id):
+            return True
+        time.sleep(0.1)
+    return codex_runtime_ready(runtime_socket, native_session_id)
 
 
 def inject_prompt(target: str, prompt: str) -> None:
@@ -351,6 +488,26 @@ def inject_prompt(target: str, prompt: str) -> None:
         inject_runtime(target, prompt)
     except SessionManagerError as exc:
         raise SystemExit(f"error: {exc}") from exc
+
+
+def queue_codex_prompt(native_session_id: str, prompt: str) -> bool:
+    """Queue a prompt through Codex's native session transport when available."""
+
+    executable = shutil.which("codex")
+    if not executable:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "queue", "--thread", native_session_id, "--message", prompt],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def latest_artifacts(root: Path, kind: str | None = None, limit: int = 5) -> list[Path]:
@@ -455,6 +612,94 @@ def claude_transcript_exists(native_session_id: str) -> bool:
     return any((config_dir / "projects").glob(f"*/{native_session_id}.jsonl"))
 
 
+def codex_rollout_exists(native_session_id: str) -> bool:
+    """Return whether Codex has a resumable rollout for a native thread."""
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    sessions = codex_home / "sessions"
+    if not sessions.is_dir():
+        return False
+    return any(
+        _codex_rollout_info(path, require_turn=True)[0] == native_session_id
+        for path in sessions.rglob(f"*{native_session_id}.jsonl")
+    )
+
+
+def codex_rollout_is_idle(native_session_id: str) -> bool:
+    """Return whether the latest recorded Codex turn has completed.
+
+    Resuming a session appends non-turn events such as
+    ``thread_settings_applied``. Those must not make an otherwise idle rollout
+    look active, so only task lifecycle events update the state.
+    """
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    sessions = codex_home / "sessions"
+    try:
+        paths = sorted(
+            sessions.rglob(f"*{native_session_id}.jsonl"),
+            key=lambda item: item.stat().st_mtime_ns,
+        )
+    except OSError:
+        return False
+    if not paths:
+        return False
+    last_turn_state: str | None = None
+    try:
+        with paths[-1].open(encoding="utf-8") as handle:
+            for line in handle:
+                record = json.loads(line)
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                event_type = payload.get("type")
+                if event_type == "task_started":
+                    last_turn_state = "active"
+                elif event_type in {"task_complete", "turn_aborted"}:
+                    last_turn_state = "idle"
+    except (OSError, json.JSONDecodeError):
+        return False
+    return last_turn_state == "idle"
+
+
+def _codex_rollout_info(path: Path, *, require_turn: bool = False) -> tuple[str | None, str | None]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first = json.loads(handle.readline())
+            has_turn = any(line.strip() for line in handle) if require_turn else True
+        payload = first.get("payload") if isinstance(first, dict) else None
+        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        native_id = payload.get("session_id") if isinstance(payload, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if require_turn and not has_turn:
+        return None, None
+    if not isinstance(native_id, str) or not native_id:
+        return None, None
+    return native_id, cwd if isinstance(cwd, str) else None
+
+
+def codex_latest_rollout_id(repo: Path) -> str | None:
+    """Find the newest recorded Codex session whose cwd is ``repo``."""
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    sessions = codex_home / "sessions"
+    if not sessions.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for path in sessions.rglob("rollout-*.jsonl"):
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    for _, path in sorted(candidates, reverse=True):
+        native_id, cwd = _codex_rollout_info(path, require_turn=True)
+        if isinstance(cwd, str) and Path(cwd).expanduser().resolve() == repo.resolve():
+            if isinstance(native_id, str) and native_id:
+                return native_id
+    return None
+
+
 def native_session_args(
     path: Path, key: str, repo: Path, native_name: str, agent_cmd: str, *, fresh: bool = False
 ) -> tuple[list[str], str | None, bool]:
@@ -489,15 +734,18 @@ def native_session_args(
         native_id = native_id or str(uuid.uuid4())
         extra = ["--resume", native_id] if resumed else ["--session-id", native_id, "--name", native_name]
     else:
-        resumed = native_id is not None
-        if native_id is None:
-            thread = CodexProvider(tokens).create(repo, native_name)
-            created = thread.get("sessionId") or thread.get("id")
-            if not isinstance(created, str) or not created:
-                raise SessionManagerError("Codex did not return a native session id")
-            native_id = created
-        extra = ["resume", native_id]
-    if not isinstance(stored, dict) or stored.get("native_session_id") != native_id:
+        resumed = native_id is not None and codex_rollout_exists(native_id)
+        if not fresh and not resumed:
+            native_id = codex_latest_rollout_id(repo)
+            resumed = native_id is not None
+        # A brand-new Codex TUI must create its own rollout. An app-server
+        # thread/start ID cannot be resumed until it has a first turn.
+        extra = ["resume", native_id] if resumed else []
+    if native_id is None:
+        if key in sessions:
+            sessions.pop(key)
+            _atomic_json_write(path, sessions)
+    elif not isinstance(stored, dict) or stored.get("native_session_id") != native_id:
         sessions[key] = {"provider": provider, "native_session_id": native_id, "created_at": now_iso()}
         _atomic_json_write(path, sessions)
     return extra, native_id, resumed
@@ -518,6 +766,8 @@ def command_solo(args: argparse.Namespace) -> None:
     )
     if runtime_state(str(runtime_socket)) == "running":
         print(f"attaching solo {args.provider} ({name}) in {repo}", flush=True)
+        if args.provider == "codex":
+            print("Full transcript: press Ctrl+T after attach; press q to return.", flush=True)
         attach_runtime(str(runtime_socket))
         return
     # Same directory + provider + name means the same native conversation.
@@ -548,6 +798,9 @@ def command_send_peer(args: argparse.Namespace) -> None:
     root, metadata = require_pair(repo, state_home, args.pair)
     target = args.target or str(pair_runtime_socket(state_home, repo, args.pair, "peer"))
     require_runtime_target(target)
+    native_id = pair_native_session_id(state_home, args.pair, "peer")
+    if native_id and not wait_for_codex_runtime(target, native_id):
+        raise SystemExit("error: peer Codex runtime is still starting; handoff was not archived")
     artifact = archive_inbox(root, args.pair, "worker-handoff")
     prompt = template("peer-prompt.md").safe_substitute(
         pair=args.pair,
@@ -577,7 +830,8 @@ def command_send_peer(args: argparse.Namespace) -> None:
             if focus else "Use the structure in:"
         ),
     )
-    inject_prompt(target, prompt)
+    if not native_id or not queue_codex_prompt(native_id, prompt):
+        inject_prompt(target, prompt)
     append_event(
         root, args.pair, "send-peer", artifact=str(artifact), target=target,
         **({"focus": focus} if focus else {}),
@@ -779,7 +1033,27 @@ def command_sessions(args: argparse.Namespace) -> None:
     selected = choose_openable_session(records, fixed_pairs)
     if isinstance(selected, PairRuntimeRecord):
         if selected.state == "running":
-            attach_runtime(selected.runtime_socket)
+            if selected.provider == "codex":
+                native_id = pair_native_session_id(manager.state_home, selected.pair, selected.role)
+                if native_id and codex_rollout_is_idle(native_id) and replay_idle_codex_runtime(
+                    selected.runtime_socket
+                ):
+                    print("replaying recent Codex transcript", flush=True)
+                    command_session(
+                        argparse.Namespace(
+                            repo=str(selected.repo),
+                            state_home=str(manager.state_home),
+                            pair=selected.pair,
+                            role=selected.role,
+                            command=None,
+                            fresh=False,
+                        )
+                    )
+                    return
+                print("Opening recent Codex transcript; press q to return.", flush=True)
+                attach_runtime(selected.runtime_socket, show_transcript=True)
+            else:
+                attach_runtime(selected.runtime_socket)
             return
         print(f"opening fixed pair {selected.pair} {selected.role}", flush=True)
         command_session(
@@ -818,7 +1092,17 @@ def command_sessions(args: argparse.Namespace) -> None:
     if action == "attach":
         if not selected.runtime_socket:
             raise SessionManagerError("session has no protected runtime")
-        attach_runtime(selected.runtime_socket)
+        if selected.provider == "codex":
+            if codex_rollout_is_idle(selected.native_session_id) and replay_idle_codex_runtime(
+                selected.runtime_socket
+            ):
+                print("replaying recent Codex transcript", flush=True)
+                manager.resume(selected)
+                return
+            print("Opening recent Codex transcript; press q to return.", flush=True)
+            attach_runtime(selected.runtime_socket, show_transcript=True)
+        else:
+            attach_runtime(selected.runtime_socket)
     if action == "resume":
         print(f"resuming {selected.key} with disconnect protection", flush=True)
         manager.resume(selected)

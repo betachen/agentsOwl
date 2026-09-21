@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from agents_owl.cli import (
     build_parser,
     choose_pair,
     command_sessions,
+    codex_rollout_is_idle,
     initialize_pair,
     initialized_pairs,
     latest_artifacts,
@@ -20,6 +22,7 @@ from agents_owl.cli import (
     pair_runtime_socket,
     policy_text,
     project_config,
+    queue_codex_prompt,
     read_json_object,
     validate_pair,
 )
@@ -105,6 +108,83 @@ class AgentsOwlTests(unittest.TestCase):
 
         attach.assert_called_once_with(expected_socket)
 
+    def test_peer_selector_opens_codex_transcript(self) -> None:
+        initialize_pair(self.repo, self.state, "demo")
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            state_home=str(self.state),
+            global_scope=False,
+            provider=None,
+            role="peer",
+            all=False,
+            json=False,
+            no_select=False,
+        )
+        expected_socket = str(pair_runtime_socket(self.state, self.repo, "demo", "peer"))
+        with patch("agents_owl.cli.sys.stdin.isatty", return_value=True), patch(
+            "agents_owl.cli.sys.stdout.isatty", return_value=True
+        ), patch("builtins.input", return_value="1"), patch(
+            "agents_owl.cli.runtime_state", return_value="running"
+        ), patch("agents_owl.cli.attach_runtime") as attach:
+            command_sessions(args)
+
+        attach.assert_called_once_with(expected_socket, show_transcript=True)
+
+    def test_idle_peer_restarts_same_codex_session_to_replay_history(self) -> None:
+        initialize_pair(self.repo, self.state, "demo")
+        bindings = self.state / "pairs" / "demo" / "native-sessions.json"
+        bindings.write_text(
+            json.dumps({"peer": {"provider": "codex", "native_session_id": "thread-1"}}),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            state_home=str(self.state),
+            global_scope=False,
+            provider=None,
+            role="peer",
+            all=False,
+            json=False,
+            no_select=False,
+        )
+        expected_socket = str(pair_runtime_socket(self.state, self.repo, "demo", "peer"))
+        with patch("agents_owl.cli.sys.stdin.isatty", return_value=True), patch(
+            "agents_owl.cli.sys.stdout.isatty", return_value=True
+        ), patch("builtins.input", return_value="1"), patch(
+            "agents_owl.cli.runtime_state", side_effect=["running", "running", "exited"]
+        ), patch("agents_owl.cli.codex_rollout_is_idle", return_value=True), patch(
+            "agents_owl.cli.replay_idle_codex_runtime", return_value=True
+        ) as replay, patch("agents_owl.cli.command_session") as start, patch(
+            "agents_owl.cli.attach_runtime"
+        ) as attach:
+            command_sessions(args)
+
+        replay.assert_called_once_with(expected_socket)
+        start.assert_called_once()
+        attach.assert_not_called()
+
+    def test_codex_idle_detection_ignores_resume_metadata_events(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "01" / "rollout-thread-1.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            "\n".join(
+                (
+                    json.dumps({"payload": {"session_id": "thread-1", "cwd": str(self.repo)}}),
+                    json.dumps({"payload": {"type": "task_complete"}}),
+                    json.dumps({"payload": {"type": "thread_settings_applied"}}),
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            self.assertTrue(codex_rollout_is_idle("thread-1"))
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"payload": {"type": "task_started"}}) + "\n")
+                handle.write(json.dumps({"payload": {"type": "thread_settings_applied"}}) + "\n")
+            self.assertFalse(codex_rollout_is_idle("thread-1"))
+
     def pair_session(self, role: str, *options: str) -> tuple[str, dict[str, object]]:
         args = build_parser().parse_args(normalize_argv([
             "--repo", str(self.repo), "--state-home", str(self.state),
@@ -143,16 +223,41 @@ class AgentsOwlTests(unittest.TestCase):
             self.assertIn("--session-id", fresh)
 
     def test_restarted_codex_pair_resumes_the_same_thread(self) -> None:
-        with patch.dict(os.environ, {}, clear=False), patch("agents_owl.cli.CodexProvider") as provider:
+        codex_home = self.root / "codex-home"
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
             os.environ.pop("AGENTS_OWL_PEER_CMD", None)
             os.environ.pop("REVIEWER_CMD", None)
-            provider.return_value.create.return_value = {"id": "thread-1"}
             first, event = self.pair_session("peer")
-            second, _ = self.pair_session("peer")
-        self.assertEqual(first, "codex resume thread-1")
-        self.assertEqual(second, first)
-        self.assertEqual(provider.return_value.create.call_count, 1)
-        provider.return_value.create.assert_called_once_with(self.repo, "owl-demo-peer")
+            rollout = codex_home / "sessions" / "2026" / "01" / "rollout-thread-1.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps({"payload": {"session_id": "thread-1", "cwd": str(self.repo)}})
+                + "\n{}\n",
+                encoding="utf-8",
+            )
+            second, resumed_event = self.pair_session("peer")
+        self.assertEqual(first, "codex")
+        self.assertNotIn("native_session_id", event)
+        self.assertEqual(second, "codex resume thread-1")
+        self.assertEqual(resumed_event["native_session_id"], "thread-1")
+        self.assertTrue(resumed_event["resumed"])
+
+    def test_restarted_codex_pair_without_rollout_starts_native_cli(self) -> None:
+        codex_home = self.root / "codex-home"
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            os.environ.pop("AGENTS_OWL_PEER_CMD", None)
+            os.environ.pop("REVIEWER_CMD", None)
+            first, _ = self.pair_session("peer")
+            metadata_only = codex_home / "sessions" / "2026" / "01" / "rollout-empty.jsonl"
+            metadata_only.parent.mkdir(parents=True)
+            metadata_only.write_text(
+                json.dumps({"payload": {"session_id": "empty", "cwd": str(self.repo)}}) + "\n",
+                encoding="utf-8",
+            )
+            second, event = self.pair_session("peer")
+        self.assertEqual(first, "codex")
+        self.assertEqual(second, "codex")
+        self.assertNotIn("native_session_id", event)
 
     def test_custom_pair_command_is_not_rewritten(self) -> None:
         for command in ("my-agent --flag", "claude --resume abc", "codex exec 'hi'"):
@@ -231,6 +336,21 @@ class AgentsOwlTests(unittest.TestCase):
         rendered = policy_text(self.repo, metadata)
         self.assertIn(str(self.repo / "AGENTS.md"), rendered)
         self.assertIn("Human decides.", rendered)
+
+    def test_queue_codex_prompt_uses_native_transport(self) -> None:
+        with patch("agents_owl.cli.shutil.which", return_value="/usr/bin/codex"), patch(
+            "agents_owl.cli.subprocess.run"
+        ) as run:
+            run.return_value.returncode = 0
+            self.assertTrue(queue_codex_prompt("thread-1", "review this handoff"))
+        run.assert_called_once_with(
+            ["/usr/bin/codex", "queue", "--thread", "thread-1", "--message", "review this handoff"],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
 
 
 if __name__ == "__main__":

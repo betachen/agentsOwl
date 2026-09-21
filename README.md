@@ -50,7 +50,7 @@ alias ff='/path/to/agentsOwl/bin/agents-owl'
 
 ff                 # 全部会话：列表 → 选择 → action
 ff i               # worker 会话（含固定 pair）：编号选择后进入
-ff r               # peer 会话（含固定 pair）：编号选择后进入
+ff r               # peer 会话（含固定 pair）：编号选择后进入并查看 Codex transcript
 ff impl             # 新建 Claude worker，交互输入 topic
 ff review           # 新建 Codex peer，交互输入 topic
 ff impl 'topic'     # 也可直接给 topic
@@ -65,6 +65,9 @@ Git 根目录）为工作环境，不读取 `.agents-owl.json`、不注入 worke
 设置和当前项目适用的规则；solo 不会禁用这些规则。
 
 按 `Ctrl+\` 脱离后，在同一目录重复同一命令即可接回仍运行的 agent。
+重新接入后若主界面没有显示旧消息，solo Codex 可按 `Ctrl+T` 打开完整 transcript，
+按 `q` 返回；`ff r` 对已经完成的 peer 会自动重启同一 rollout 来重绘历史，
+对仍在执行的 peer 则只 attach，不会打断任务。这只是显示方式，不表示上下文丢失。
 不同目录和不同 provider 相互独立。若要在同一目录并行处理另一件事，使用
 `ff solo claude --name another-task`，之后用同一名称接回。正常退出 agent
 后，再执行该命令会启动新对话；solo 不负责恢复已结束对话的历史。

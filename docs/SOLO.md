@@ -15,6 +15,10 @@ ff solo codex
 按 `Ctrl+\` 返回 shell，任务继续。SSH 断开也不会结束后台 agent。
 回到同一目录，执行原命令即可重连，例如 `ff solo claude`。
 
+重新 attach 后，原生 TUI 通常只显示当前视图，不会把整段旧对话重新绘制到主
+界面。这不代表上下文丢失。Codex 中按 `Ctrl+T` 打开完整 transcript，用方向键
+或 PageUp/PageDown 滚动，按 `q` 返回主界面。
+
 同一个“目录 + provider + 名称”对应一个运行中的会话。默认名称是 `default`。
 想另开一份上下文时给一个新名称：
 
@@ -47,7 +51,8 @@ solo 会话通过 `ff solo ...` 接回，不出现在 worker/peer 的 `ff i/r` �
 - 启动时移除继承的 `AGENTS_OWL_*` 协作变量与旧 worker/peer 命令变量，避免误登记为 managed session。
 - 正常保留 provider 的全局设置、认证环境及适用于当前目录的项目规则。solo 不是配置隔离或文件访问沙箱。
 - runtime socket 位于 AgentsOwl state 目录，默认是 `~/.local/state/agents-owl/runtimes/`，不在任务目录生成额外文件。
-- “目录 + provider + 名称” 与原生会话 ID 的绑定保存在 `~/.local/state/agents-owl/solo/native-sessions.json`。
+- Codex 首次启动由原生 TUI 创建 rollout；产生 rollout 后，“目录 + provider + 名称”
+  与原生会话 ID 的绑定保存在 `~/.local/state/agents-owl/solo/native-sessions.json`。
 
 `ff` 的 alias 应直接指向工具，不要带固定项目的 `cd`：
 

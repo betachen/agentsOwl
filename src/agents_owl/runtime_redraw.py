@@ -60,7 +60,25 @@ def refresh_attached_screen(client: subprocess.Popen, runtime_socket: str) -> No
             _send_size(control, restored)
 
 
-def attach_with_redraw(argv: list[str], runtime_socket: str) -> None:
+def _send_post_attach_input(dtach: list[str], runtime_socket: str, payload: bytes) -> None:
+    """Send a provider shortcut after the dtach client has registered."""
+
+    try:
+        subprocess.run(
+            [*dtach, "-p", runtime_socket],
+            input=payload,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        # The user may have detached before the shortcut was delivered.
+        pass
+
+
+def attach_with_redraw(
+    argv: list[str], runtime_socket: str, post_attach: tuple[list[str], bytes] | None = None
+) -> None:
     """Keep dtach responsible for input, detach keys and terminal restoration."""
 
     with subprocess.Popen(argv) as client:
@@ -70,6 +88,9 @@ def attach_with_redraw(argv: list[str], runtime_socket: str) -> None:
             except (OSError, termios.error):
                 # Redraw is best-effort; a failed refresh must not end a session.
                 pass
+            if post_attach is not None and client.poll() is None:
+                time.sleep(0.2)
+                _send_post_attach_input(post_attach[0], runtime_socket, post_attach[1])
             code = client.wait()
         except BaseException:
             # This is only the attaching client, never the runtime/agent daemon.

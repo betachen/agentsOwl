@@ -41,8 +41,8 @@ sudo apt install dtach
 
 如果可执行文件不叫 `dtach`，可以设置 `AGENTS_OWL_DTACH_CMD`。
 
-Codex 无需额外配置。AgentsOwl 使用 app-server 创建并命名原生 thread，然后
-在受保护 PTY 中执行 `codex resume <native-id>`。
+Codex 无需额外配置。首次启动直接运行原生 `codex`；已有 rollout 时，AgentsOwl
+在受保护 PTY 中执行 `codex resume <native-id>`。app-server 只用于会话元数据管理。
 
 Claude 需要一次性安装 `SessionStart`/`SessionEnd` hooks：
 
@@ -74,9 +74,16 @@ ff review [TOPIC]  # 新建 Codex peer
 （例如用 `Ctrl+D`、`/exit` 退出后）会恢复该角色原来的 provider 原生会话，
 上下文保持不变：
 
+`ff r` 进入正在运行的 Codex peer 时，如果最近一轮已经结束，会停止空闲的 Codex
+子进程并用同一 rollout ID 重启，以完整重绘历史；这不会创建新会话。若任务仍在
+执行，则不会重启，只 attach 到现有 runtime。需要手动打开 transcript 时仍可按
+`Ctrl+T`，按 `q` 返回输入界面。
+
 - Claude：首次启动用 `--session-id` 固定 ID，之后用 `claude --resume <id>`；
   如果上次没有产生任何对话（无 transcript），沿用同一 ID 重新开始。
-- Codex：首次启动时通过 app-server 创建命名 thread，之后 `codex resume <id>`。
+- Codex：首次启动直接运行原生 `codex`，让 Codex 自己创建可恢复的 rollout；之后
+  使用该 rollout 的 ID 执行 `codex resume <id>`。如果刚启动后立即退出、尚未产生
+  rollout，下次仍直接启动新的原生 TUI。
 
 绑定关系保存在 `pairs/<PAIR>/native-sessions.json`。需要为某个角色开启全新
 对话时：

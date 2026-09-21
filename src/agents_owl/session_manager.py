@@ -126,14 +126,17 @@ def launch_runtime(
         raise SessionManagerError(f"could not start protected runtime: {exc}") from exc
 
 
-def attach_runtime(runtime_socket: str) -> None:
+def attach_runtime(runtime_socket: str, *, show_transcript: bool = False) -> None:
     if runtime_state(runtime_socket) != "running":
         raise SessionManagerError(f"runtime is not running: {runtime_socket}")
     dtach = require_dtach()
     argv = [*dtach, "-a", runtime_socket, "-z", "-r", "ctrl_l"]
     try:
         if os.isatty(0):
-            attach_with_redraw(argv, runtime_socket)
+            if show_transcript:
+                attach_with_redraw(argv, runtime_socket, (dtach, b"\x14"))
+            else:
+                attach_with_redraw(argv, runtime_socket)
         else:
             os.execvp(argv[0], argv)
     except OSError as exc:

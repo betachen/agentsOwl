@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -20,13 +21,13 @@ class SoloTests(unittest.TestCase):
         (self.work.parent / ".git").mkdir()
         self.state = self.root / "state"
         self.claude_home = self.root / "claude-home"
-        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.claude_home)})
+        self.codex_home = self.root / "codex-home"
+        environment = patch.dict(
+            os.environ,
+            {"CLAUDE_CONFIG_DIR": str(self.claude_home), "CODEX_HOME": str(self.codex_home)},
+        )
         environment.start()
         self.addCleanup(environment.stop)
-        codex = patch("agents_owl.cli.CodexProvider")
-        self.codex = codex.start()
-        self.addCleanup(codex.stop)
-        self.codex.return_value.create.return_value = {"id": "codex-thread"}
 
     def args(self, provider: str = "claude", *options: str):
         return build_parser().parse_args([
@@ -57,7 +58,6 @@ class SoloTests(unittest.TestCase):
             self.assertEqual(runtime_socket.parent, self.state / "runtimes")
             self.assertTrue(set(inherited).issubset(launch.call_args.kwargs["remove_environment"]))
         self.assertEqual(list(self.work.iterdir()), [])
-        self.codex.return_value.create.assert_called_once_with(self.work, "solo default")
         self.assertFalse((self.state / "pairs").exists())
         self.assertFalse((self.state / "sessions").exists())
 
@@ -103,9 +103,16 @@ class SoloTests(unittest.TestCase):
         self.assertNotEqual(fresh[2], native_id)
 
     def test_restarted_codex_solo_resumes_the_same_thread(self) -> None:
+        self.assertEqual(self.launched_command("codex"), ["codex"])
+        rollout = self.codex_home / "sessions" / "2026" / "01" / "rollout-codex-thread.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            json.dumps({"payload": {"session_id": "codex-thread", "cwd": str(self.work)}})
+            + "\n{}\n",
+            encoding="utf-8",
+        )
         self.assertEqual(self.launched_command("codex"), ["codex", "resume", "codex-thread"])
-        self.assertEqual(self.launched_command("codex"), ["codex", "resume", "codex-thread"])
-        self.codex.return_value.create.assert_called_once()
+        self.assertEqual(self.launched_command("codex", "--fresh"), ["codex"])
 
     def test_directory_provider_and_name_have_independent_runtimes(self) -> None:
         sockets = []

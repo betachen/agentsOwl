@@ -52,6 +52,29 @@ class RedrawTests(unittest.TestCase):
         client.wait.assert_called_once()
         client.terminate.assert_not_called()
 
+    def test_post_attach_shortcut_is_sent_without_affecting_attach_client(self) -> None:
+        client = Mock()
+        client.poll.return_value = None
+        client.wait.return_value = 0
+        with patch("agents_owl.runtime_redraw.subprocess.Popen") as spawn, patch(
+            "agents_owl.runtime_redraw.refresh_attached_screen"
+        ), patch("agents_owl.runtime_redraw.time.sleep"), patch(
+            "agents_owl.runtime_redraw.subprocess.run"
+        ) as send:
+            spawn.return_value.__enter__.return_value = client
+            attach_with_redraw(
+                ["dtach", "-a", "/tmp/selected.sock"],
+                "/tmp/selected.sock",
+                (["dtach"], b"\x14"),
+            )
+        send.assert_called_once_with(
+            ["dtach", "-p", "/tmp/selected.sock"],
+            input=b"\x14",
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def test_finished_client_does_not_resize_runtime(self) -> None:
         client = Mock()
         client.poll.return_value = 0
