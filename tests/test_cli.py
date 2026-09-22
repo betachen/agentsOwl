@@ -14,6 +14,7 @@ from agents_owl.cli import (
     build_parser,
     choose_pair,
     command_sessions,
+    command_session,
     codex_rollout_is_idle,
     initialize_pair,
     initialized_pairs,
@@ -23,6 +24,7 @@ from agents_owl.cli import (
     policy_text,
     project_config,
     queue_codex_prompt,
+    recent_codex_context,
     read_json_object,
     validate_pair,
 )
@@ -185,6 +187,59 @@ class AgentsOwlTests(unittest.TestCase):
                 handle.write(json.dumps({"payload": {"type": "thread_settings_applied"}}) + "\n")
             self.assertFalse(codex_rollout_is_idle("thread-1"))
 
+    def test_recent_codex_context_keeps_latest_reply_and_limits_turns(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "01" / "rollout-thread-1.jsonl"
+        rollout.parent.mkdir(parents=True)
+        records = []
+        for index in range(6):
+            records.extend(
+                (
+                    {"payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"question-{index}"}]}},
+                    {"payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": f"answer-{index}"}]}},
+                )
+            )
+        rollout.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            preview = recent_codex_context("thread-1", turns=4)
+        self.assertNotIn("question-0", preview)
+        self.assertIn("question-2", preview)
+        self.assertIn("answer-5", preview)
+        self.assertIn("Ctrl+T opens the full transcript", preview)
+
+    def test_recent_pair_resume_previews_context_without_changing_session(self) -> None:
+        root = initialize_pair(self.repo, self.state, "demo")
+        native_id = "thread-1"
+        (root / "native-sessions.json").write_text(
+            json.dumps({"peer": {"provider": "codex", "native_session_id": native_id}}),
+            encoding="utf-8",
+        )
+        codex_home = self.root / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "01" / "rollout-thread-1.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            "\n".join(
+                (
+                    json.dumps({"payload": {"session_id": native_id, "cwd": str(self.repo)}}),
+                    json.dumps({"payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "question"}]}}),
+                    json.dumps({"payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "latest answer"}]}}),
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            repo=str(self.repo), state_home=str(self.state), pair="demo", role="peer",
+            command=None, fresh=False, recent_context=True,
+        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), patch(
+            "agents_owl.cli.runtime_state", return_value="exited"
+        ), patch("agents_owl.cli.launch_runtime") as launch:
+            command_session(args)
+        startup = launch.call_args.args[2][-1]
+        self.assertIn("codex resume thread-1 --no-alt-screen", startup)
+        self.assertIn("latest answer", startup)
+
     def pair_session(self, role: str, *options: str) -> tuple[str, dict[str, object]]:
         args = build_parser().parse_args(normalize_argv([
             "--repo", str(self.repo), "--state-home", str(self.state),
@@ -328,6 +383,45 @@ class AgentsOwlTests(unittest.TestCase):
         ):
             args.func(args)
         self.assertTrue(inbox.is_file())
+        self.assertEqual(list((root / "artifacts").iterdir()), [])
+        inject.assert_not_called()
+
+    def test_send_peer_rejects_stale_native_worker_handoff(self) -> None:
+        root = initialize_pair(self.repo, self.state, "demo")
+        native_id = "worker-claude-session"
+        (root / "native-sessions.json").write_text(
+            json.dumps({"worker": {"provider": "claude", "native_session_id": native_id}}),
+            encoding="utf-8",
+        )
+        claude_home = self.root / "claude-home"
+        transcript = claude_home / "projects" / "-repo" / f"{native_id}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": "2026-09-22T12:00:00+00:00",
+                    "origin": {"kind": "human"},
+                    "message": {"role": "user", "content": "new worker request"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        handoff = root / "inbox" / "worker-handoff.md"
+        handoff.write_text("old handoff\n", encoding="utf-8")
+        os.utime(handoff, (1_700_000_000, 1_700_000_000))
+        args = build_parser().parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state),
+            "send-peer", "demo",
+        ])
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_home)}), patch(
+            "agents_owl.cli.require_runtime_target"
+        ), patch("agents_owl.cli.inject_prompt") as inject, self.assertRaisesRegex(
+            SystemExit, "stale worker handoff"
+        ):
+            args.func(args)
+        self.assertTrue(handoff.is_file())
         self.assertEqual(list((root / "artifacts").iterdir()), [])
         inject.assert_not_called()
 

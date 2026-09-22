@@ -74,10 +74,10 @@ ff review [TOPIC]  # 新建 Codex peer
 （例如用 `Ctrl+D`、`/exit` 退出后）会恢复该角色原来的 provider 原生会话，
 上下文保持不变：
 
-`ff r` 进入正在运行的 Codex peer 时，如果最近一轮已经结束，会停止空闲的 Codex
-子进程并用同一 rollout ID 重启，以完整重绘历史；这不会创建新会话。若任务仍在
-执行，则不会重启，只 attach 到现有 runtime。需要手动打开 transcript 时仍可按
-`Ctrl+T`，按 `q` 返回输入界面。
+`ff r` 进入已经结束最近一轮的 Codex peer 时，会停止空闲的 Codex 子进程并用同一
+rollout ID 重启；这不会创建新会话。恢复界面默认预览最近约四轮问答，确保最近一条
+回复可见，同时保留完整原生上下文。需要查看全部 transcript 时仍可按 `Ctrl+T`，按
+`q` 返回输入界面。若任务仍在执行，则不会重启，只 attach 到现有 runtime。
 
 - Claude：首次启动用 `--session-id` 固定 ID，之后用 `claude --resume <id>`；
   如果上次没有产生任何对话（无 transcript），沿用同一 ID 重新开始。

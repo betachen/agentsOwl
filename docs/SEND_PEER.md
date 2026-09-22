@@ -66,6 +66,13 @@ ff send-peer range-v01-r2 --focus '请用中文回答：
 可直接 `ff r` 进入 peer 提问，不必重复发送。此时如需回传，也请它更新
 `inbox/peer-response.md`。
 
+`send-peer` 还会校验 handoff 是否至少是在 worker 最近一轮输入之后生成的。
+如果 worker 已经产生了新的回答、但没有重写 handoff，命令会报
+`stale worker handoff`，并保留 inbox 文件，不会归档或发送旧内容。请先让 worker
+按模板重写当前轮的 `worker-handoff.md`，再重试。这个检查只对 AgentsOwl 能读取
+provider transcript 的原生 Claude/Codex pair 生效；自定义 worker 命令仍需人工确认
+交接材料。
+
 通用回复模板已精简为三部分：
 
 - **结论与下一步**：直接回答主要问题，说明现在该做什么、什么可以推迟。

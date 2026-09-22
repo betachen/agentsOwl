@@ -355,6 +355,25 @@ def pair_native_session_id(state_home: Path, pair: str, role: str) -> str | None
     return native_id if isinstance(native_id, str) and native_id else None
 
 
+def pair_native_session_binding(state_home: Path, pair: str, role: str) -> tuple[str, str] | None:
+    """Return the provider and native id bound to one fixed-pair role."""
+
+    path = pair_root(state_home, pair) / "native-sessions.json"
+    if not path.is_file():
+        return None
+    bindings = read_json_object(path, "native session bindings")
+    value = bindings.get(ROLE_ALIASES[role])
+    if not isinstance(value, dict):
+        return None
+    provider = value.get("provider")
+    native_id = value.get("native_session_id")
+    if not isinstance(provider, str) or not provider:
+        return None
+    if not isinstance(native_id, str) or not native_id:
+        return None
+    return provider, native_id
+
+
 def require_runtime_target(target: str) -> None:
     if runtime_state(target) != "running":
         raise SystemExit(f"error: protected runtime is not running: {target}")
@@ -510,6 +529,124 @@ def queue_codex_prompt(native_session_id: str, prompt: str) -> bool:
     return result.returncode == 0
 
 
+def _record_timestamp(record: dict[str, Any]) -> float | None:
+    value = record.get("timestamp")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _claude_user_prompt(record: dict[str, Any]) -> bool:
+    """Return whether a Claude JSONL record starts a real provider turn.
+
+    Tool results are stored as ``user`` records too, but they are continuations
+    of the current turn.  Counting them would reject a handoff written midway
+    through an otherwise current turn.
+    """
+
+    if record.get("type") != "user":
+        return False
+    content = record.get("message", {}).get("content") if isinstance(record.get("message"), dict) else None
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") != "tool_result" for item in content)
+
+
+def latest_worker_prompt_time(provider: str, native_session_id: str) -> float | None:
+    """Find the start time of the latest worker turn from provider history."""
+
+    if provider == "claude":
+        config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+        paths = config_dir / "projects"
+        candidates = paths.glob(f"*/{native_session_id}.jsonl") if paths.is_dir() else ()
+        latest: float | None = None
+        for path in candidates:
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(record, dict) and _claude_user_prompt(record):
+                            timestamp = _record_timestamp(record)
+                            if timestamp is not None and (latest is None or timestamp > latest):
+                                latest = timestamp
+            except OSError:
+                continue
+        return latest
+
+    if provider == "codex":
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+        sessions = codex_home / "sessions"
+        if not sessions.is_dir():
+            return None
+        latest = None
+        try:
+            paths = sessions.rglob(f"*{native_session_id}.jsonl")
+            for path in paths:
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        payload = record.get("payload") if isinstance(record, dict) else None
+                        if not isinstance(payload, dict):
+                            continue
+                        is_user = payload.get("type") == "user_message" or (
+                            payload.get("type") == "message" and payload.get("role") == "user"
+                        )
+                        if not is_user:
+                            continue
+                        timestamp = _record_timestamp(record)
+                        if timestamp is not None and (latest is None or timestamp > latest):
+                            latest = timestamp
+        except OSError:
+            return None
+        return latest
+
+    return None
+
+
+def require_current_worker_handoff(state_home: Path, pair: str, handoff: Path) -> None:
+    """Reject a handoff that predates the worker's latest provider turn.
+
+    AgentsOwl deliberately reviews the bounded handoff, not an entire provider
+    transcript.  The freshness check prevents silently reviewing an older
+    handoff after the worker has produced a newer answer.  A two-second margin
+    covers filesystem/provider timestamp precision and handoff writes made just
+    before the worker's final text for the same turn.
+    """
+
+    binding = pair_native_session_binding(state_home, pair, "worker")
+    if binding is None:
+        # Custom worker commands have no provider transcript that AgentsOwl can
+        # inspect; retain the established explicit-handoff workflow for them.
+        return
+    provider, native_id = binding
+    latest_prompt = latest_worker_prompt_time(provider, native_id)
+    if latest_prompt is None:
+        raise SystemExit(
+            "error: cannot verify worker handoff freshness; provider transcript has no readable latest turn"
+        )
+    handoff_time = handoff.stat().st_mtime
+    if handoff_time + 2.0 < latest_prompt:
+        latest = datetime.fromtimestamp(latest_prompt).astimezone().isoformat(timespec="seconds")
+        handoff_stamp = datetime.fromtimestamp(handoff_time).astimezone().isoformat(timespec="seconds")
+        raise SystemExit(
+            "error: stale worker handoff; the worker has a newer turn ("
+            f"{latest}) than this file ({handoff_stamp}). "
+            "Ask the worker to rewrite inbox/worker-handoff.md for the current answer; "
+            "the handoff was not archived or sent"
+        )
+
+
 def latest_artifacts(root: Path, kind: str | None = None, limit: int = 5) -> list[Path]:
     files = [path for path in (root / "artifacts").glob("*.md") if path.is_file()]
     if kind:
@@ -582,11 +719,21 @@ def command_session(args: argparse.Namespace) -> None:
         root / "native-sessions.json", role, repo, session, agent_cmd,
         fresh=getattr(args, "fresh", False),
     )
+    recent_context = bool(getattr(args, "recent_context", False) and resumed and native_id)
+    try:
+        agent_tokens = shlex.split(agent_cmd)
+    except ValueError:
+        agent_tokens = []
+    provider = Path(agent_tokens[0]).name if agent_tokens else ""
+    recent_preview = recent_codex_context(native_id) if recent_context and provider == "codex" else ""
+    if recent_context and provider == "codex" and "--no-alt-screen" not in agent_tokens and "--no-alt-screen" not in extra:
+        extra = [*extra, "--no-alt-screen"]
     if extra:
         agent_cmd = f"{agent_cmd} {shlex.join(extra)}"
     output_name = "worker-handoff.md" if role == "worker" else "peer-response.md"
     output_path = root / "inbox" / output_name
     role_template = template_path(output_name)
+    recent_startup = f"printf '%s\\n' {shlex.quote(recent_preview)}; " if recent_preview else ""
     startup = (
         "printf '\\n=== AgentsOwl ===\\n'; "
         f"printf 'pair: %s\\n' {shlex.quote(args.pair)}; "
@@ -595,6 +742,7 @@ def command_session(args: argparse.Namespace) -> None:
         f"printf 'session: %s\\n' {shlex.quote(session)}; "
         f"printf 'deliverable: %s\\n' {shlex.quote(str(output_path))}; "
         f"printf 'handoff template: %s\\n\\n' {shlex.quote(str(role_template))}; "
+        f"{recent_startup}"
         f"exec {agent_cmd}"
     )
     event: dict[str, object] = {"role": role, "session": session, "command": agent_cmd}
@@ -700,6 +848,100 @@ def codex_latest_rollout_id(repo: Path) -> str | None:
     return None
 
 
+def _codex_rollout_paths(native_session_id: str) -> list[Path]:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    sessions = codex_home / "sessions"
+    if not sessions.is_dir():
+        return []
+    try:
+        return sorted(
+            (path for path in sessions.rglob(f"*{native_session_id}.jsonl") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+    except OSError:
+        return []
+
+
+def _codex_message_text(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type not in {"input_text", "output_text", "text"}:
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
+
+
+def _trim_recent_text(text: str, limit: int = 1800) -> str:
+    if len(text) <= limit:
+        return text
+    half = (limit - 80) // 2
+    return f"{text[:half]}\n… [truncated] …\n{text[-half:]}"
+
+
+def _tail_jsonl_lines(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[str]:
+    """Read only a bounded tail of a JSONL transcript."""
+
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            offset = max(0, size - max_bytes)
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return []
+    if offset:
+        _, _, data = data.partition(b"\n")
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def recent_codex_context(native_session_id: str, turns: int = 4) -> str:
+    """Format a small recent-turn preview without changing native context."""
+
+    if turns < 1:
+        return ""
+    conversations: list[dict[str, Any]] = []
+    paths = _codex_rollout_paths(native_session_id)
+    for line in _tail_jsonl_lines(paths[-1]) if paths else []:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = record.get("payload") if isinstance(record, dict) else None
+        if not isinstance(payload, dict) or payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        text = _codex_message_text(payload)
+        if not text:
+            continue
+        if role == "user":
+            conversations.append({"user": text, "assistant": []})
+        elif conversations:
+            conversations[-1]["assistant"].append(text)
+    if not conversations:
+        return ""
+    lines = ["=== Recent Codex context (native history remains complete) ==="]
+    for index, conversation in enumerate(conversations[-turns:], 1):
+        lines.append(f"\n[Recent turn {index}] User:")
+        lines.append(_trim_recent_text(str(conversation["user"])))
+        replies = conversation["assistant"]
+        lines.append("Assistant:")
+        lines.append(_trim_recent_text("\n".join(replies)) if replies else "(no completed reply yet)")
+    lines.append("\n=== End recent context; Ctrl+T opens the full transcript ===")
+    return "\n".join(lines)
+
+
 def native_session_args(
     path: Path, key: str, repo: Path, native_name: str, agent_cmd: str, *, fresh: bool = False
 ) -> tuple[list[str], str | None, bool]:
@@ -801,6 +1043,10 @@ def command_send_peer(args: argparse.Namespace) -> None:
     native_id = pair_native_session_id(state_home, args.pair, "peer")
     if native_id and not wait_for_codex_runtime(target, native_id):
         raise SystemExit("error: peer Codex runtime is still starting; handoff was not archived")
+    handoff = root / "inbox" / "worker-handoff.md"
+    if not handoff.is_file():
+        raise SystemExit(f"error: missing inbox artifact: {handoff}")
+    require_current_worker_handoff(state_home, args.pair, handoff)
     artifact = archive_inbox(root, args.pair, "worker-handoff")
     prompt = template("peer-prompt.md").safe_substitute(
         pair=args.pair,
@@ -1047,6 +1293,7 @@ def command_sessions(args: argparse.Namespace) -> None:
                             role=selected.role,
                             command=None,
                             fresh=False,
+                            recent_context=True,
                         )
                     )
                     return
@@ -1064,6 +1311,7 @@ def command_sessions(args: argparse.Namespace) -> None:
                 role=selected.role,
                 command=None,
                 fresh=False,
+                recent_context=True,
             )
         )
         return
