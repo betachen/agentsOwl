@@ -78,12 +78,14 @@ ff review [TOPIC]  # 新建 Codex peer
 rollout ID 重启；这不会创建新会话。恢复界面默认预览最近约四轮问答，确保最近一条
 回复可见，同时保留完整原生上下文。需要查看全部 transcript 时仍可按 `Ctrl+T`，按
 `q` 返回输入界面。若任务仍在执行，则不会重启，只 attach 到现有 runtime。
+对正在运行的 Codex，`ff r` 不会自动发送 `Ctrl+T`，因此会直接回到当前主界面。
 
 - Claude：首次启动用 `--session-id` 固定 ID，之后用 `claude --resume <id>`；
   如果上次没有产生任何对话（无 transcript），沿用同一 ID 重新开始。
 - Codex：首次启动直接运行原生 `codex`，让 Codex 自己创建可恢复的 rollout；之后
   使用该 rollout 的 ID 执行 `codex resume <id>`。如果刚启动后立即退出、尚未产生
-  rollout，下次仍直接启动新的原生 TUI。
+  rollout，下次仍直接启动新的原生 TUI。自动发现 rollout 时，如果候选 ID 已经
+  绑定到其他 pair，会拒绝复用并启动新的原生 TUI，避免两个 pair 共享同一段上下文。
 
 绑定关系保存在 `pairs/<PAIR>/native-sessions.json`。需要为某个角色开启全新
 对话时：

@@ -355,25 +355,6 @@ def pair_native_session_id(state_home: Path, pair: str, role: str) -> str | None
     return native_id if isinstance(native_id, str) and native_id else None
 
 
-def pair_native_session_binding(state_home: Path, pair: str, role: str) -> tuple[str, str] | None:
-    """Return the provider and native id bound to one fixed-pair role."""
-
-    path = pair_root(state_home, pair) / "native-sessions.json"
-    if not path.is_file():
-        return None
-    bindings = read_json_object(path, "native session bindings")
-    value = bindings.get(ROLE_ALIASES[role])
-    if not isinstance(value, dict):
-        return None
-    provider = value.get("provider")
-    native_id = value.get("native_session_id")
-    if not isinstance(provider, str) or not provider:
-        return None
-    if not isinstance(native_id, str) or not native_id:
-        return None
-    return provider, native_id
-
-
 def require_runtime_target(target: str) -> None:
     if runtime_state(target) != "running":
         raise SystemExit(f"error: protected runtime is not running: {target}")
@@ -527,124 +508,6 @@ def queue_codex_prompt(native_session_id: str, prompt: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
-
-
-def _record_timestamp(record: dict[str, Any]) -> float | None:
-    value = record.get("timestamp")
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def _claude_user_prompt(record: dict[str, Any]) -> bool:
-    """Return whether a Claude JSONL record starts a real provider turn.
-
-    Tool results are stored as ``user`` records too, but they are continuations
-    of the current turn.  Counting them would reject a handoff written midway
-    through an otherwise current turn.
-    """
-
-    if record.get("type") != "user":
-        return False
-    content = record.get("message", {}).get("content") if isinstance(record.get("message"), dict) else None
-    if isinstance(content, str):
-        return bool(content.strip())
-    if not isinstance(content, list):
-        return False
-    return any(isinstance(item, dict) and item.get("type") != "tool_result" for item in content)
-
-
-def latest_worker_prompt_time(provider: str, native_session_id: str) -> float | None:
-    """Find the start time of the latest worker turn from provider history."""
-
-    if provider == "claude":
-        config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
-        paths = config_dir / "projects"
-        candidates = paths.glob(f"*/{native_session_id}.jsonl") if paths.is_dir() else ()
-        latest: float | None = None
-        for path in candidates:
-            try:
-                with path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(record, dict) and _claude_user_prompt(record):
-                            timestamp = _record_timestamp(record)
-                            if timestamp is not None and (latest is None or timestamp > latest):
-                                latest = timestamp
-            except OSError:
-                continue
-        return latest
-
-    if provider == "codex":
-        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-        sessions = codex_home / "sessions"
-        if not sessions.is_dir():
-            return None
-        latest = None
-        try:
-            paths = sessions.rglob(f"*{native_session_id}.jsonl")
-            for path in paths:
-                with path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        payload = record.get("payload") if isinstance(record, dict) else None
-                        if not isinstance(payload, dict):
-                            continue
-                        is_user = payload.get("type") == "user_message" or (
-                            payload.get("type") == "message" and payload.get("role") == "user"
-                        )
-                        if not is_user:
-                            continue
-                        timestamp = _record_timestamp(record)
-                        if timestamp is not None and (latest is None or timestamp > latest):
-                            latest = timestamp
-        except OSError:
-            return None
-        return latest
-
-    return None
-
-
-def require_current_worker_handoff(state_home: Path, pair: str, handoff: Path) -> None:
-    """Reject a handoff that predates the worker's latest provider turn.
-
-    AgentsOwl deliberately reviews the bounded handoff, not an entire provider
-    transcript.  The freshness check prevents silently reviewing an older
-    handoff after the worker has produced a newer answer.  A two-second margin
-    covers filesystem/provider timestamp precision and handoff writes made just
-    before the worker's final text for the same turn.
-    """
-
-    binding = pair_native_session_binding(state_home, pair, "worker")
-    if binding is None:
-        # Custom worker commands have no provider transcript that AgentsOwl can
-        # inspect; retain the established explicit-handoff workflow for them.
-        return
-    provider, native_id = binding
-    latest_prompt = latest_worker_prompt_time(provider, native_id)
-    if latest_prompt is None:
-        raise SystemExit(
-            "error: cannot verify worker handoff freshness; provider transcript has no readable latest turn"
-        )
-    handoff_time = handoff.stat().st_mtime
-    if handoff_time + 2.0 < latest_prompt:
-        latest = datetime.fromtimestamp(latest_prompt).astimezone().isoformat(timespec="seconds")
-        handoff_stamp = datetime.fromtimestamp(handoff_time).astimezone().isoformat(timespec="seconds")
-        raise SystemExit(
-            "error: stale worker handoff; the worker has a newer turn ("
-            f"{latest}) than this file ({handoff_stamp}). "
-            "Ask the worker to rewrite inbox/worker-handoff.md for the current answer; "
-            "the handoff was not archived or sent"
-        )
 
 
 def latest_artifacts(root: Path, kind: str | None = None, limit: int = 5) -> list[Path]:
@@ -848,6 +711,43 @@ def codex_latest_rollout_id(repo: Path) -> str | None:
     return None
 
 
+def native_session_owned_elsewhere(path: Path, provider: str, native_session_id: str) -> bool:
+    """Return whether a pair binding already owns ``native_session_id``.
+
+    Codex does not let the plain interactive command choose a new thread ID
+    before its first turn.  AgentsOwl therefore discovers that ID on a later
+    invocation by looking at the newest rollout in the repository.  Never
+    adopt a rollout that another pair already owns: doing so would make two
+    independent pair roles resume the same provider conversation.
+    """
+
+    pairs_dir = path.parent.parent
+    if pairs_dir.name != "pairs" or not pairs_dir.is_dir():
+        return False
+    try:
+        current = path.resolve()
+    except OSError:
+        current = path
+    for candidate in pairs_dir.glob("*/native-sessions.json"):
+        try:
+            if candidate.resolve() == current:
+                continue
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for binding in payload.values():
+            if not isinstance(binding, dict):
+                continue
+            if (
+                binding.get("provider") == provider
+                and binding.get("native_session_id") == native_session_id
+            ):
+                return True
+    return False
+
+
 def _codex_rollout_paths(native_session_id: str) -> list[Path]:
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
     sessions = codex_home / "sessions"
@@ -971,6 +871,8 @@ def native_session_args(
     if not fresh and isinstance(stored, dict) and stored.get("provider") == provider:
         value = stored.get("native_session_id")
         native_id = value if isinstance(value, str) and value else None
+    if native_id and native_session_owned_elsewhere(path, provider, native_id):
+        native_id = None
     if provider == "claude":
         resumed = native_id is not None and claude_transcript_exists(native_id)
         native_id = native_id or str(uuid.uuid4())
@@ -978,8 +880,10 @@ def native_session_args(
     else:
         resumed = native_id is not None and codex_rollout_exists(native_id)
         if not fresh and not resumed:
-            native_id = codex_latest_rollout_id(repo)
-            resumed = native_id is not None
+            candidate = codex_latest_rollout_id(repo)
+            if candidate and not native_session_owned_elsewhere(path, provider, candidate):
+                native_id = candidate
+                resumed = True
         # A brand-new Codex TUI must create its own rollout. An app-server
         # thread/start ID cannot be resumed until it has a first turn.
         extra = ["resume", native_id] if resumed else []
@@ -1046,7 +950,6 @@ def command_send_peer(args: argparse.Namespace) -> None:
     handoff = root / "inbox" / "worker-handoff.md"
     if not handoff.is_file():
         raise SystemExit(f"error: missing inbox artifact: {handoff}")
-    require_current_worker_handoff(state_home, args.pair, handoff)
     artifact = archive_inbox(root, args.pair, "worker-handoff")
     prompt = template("peer-prompt.md").safe_substitute(
         pair=args.pair,
@@ -1297,8 +1200,10 @@ def command_sessions(args: argparse.Namespace) -> None:
                         )
                     )
                     return
-                print("Opening recent Codex transcript; press q to return.", flush=True)
-                attach_runtime(selected.runtime_socket, show_transcript=True)
+                # A live runtime is already showing the native Codex TUI.  Do
+                # not inject Ctrl+T here: that opens the transcript browser
+                # and leaves ff r in a view that requires q to return.
+                attach_runtime(selected.runtime_socket)
             else:
                 attach_runtime(selected.runtime_socket)
             return
@@ -1347,8 +1252,9 @@ def command_sessions(args: argparse.Namespace) -> None:
                 print("replaying recent Codex transcript", flush=True)
                 manager.resume(selected)
                 return
-            print("Opening recent Codex transcript; press q to return.", flush=True)
-            attach_runtime(selected.runtime_socket, show_transcript=True)
+            # A live runtime is already showing the native Codex TUI.  Do not
+            # inject Ctrl+T here; attach directly and preserve the active view.
+            attach_runtime(selected.runtime_socket)
         else:
             attach_runtime(selected.runtime_socket)
     if action == "resume":

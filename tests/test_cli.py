@@ -110,7 +110,7 @@ class AgentsOwlTests(unittest.TestCase):
 
         attach.assert_called_once_with(expected_socket)
 
-    def test_peer_selector_opens_codex_transcript(self) -> None:
+    def test_peer_selector_attaches_codex_without_opening_transcript(self) -> None:
         initialize_pair(self.repo, self.state, "demo")
         args = argparse.Namespace(
             repo=str(self.repo),
@@ -130,7 +130,7 @@ class AgentsOwlTests(unittest.TestCase):
         ), patch("agents_owl.cli.attach_runtime") as attach:
             command_sessions(args)
 
-        attach.assert_called_once_with(expected_socket, show_transcript=True)
+        attach.assert_called_once_with(expected_socket)
 
     def test_idle_peer_restarts_same_codex_session_to_replay_history(self) -> None:
         initialize_pair(self.repo, self.state, "demo")
@@ -314,6 +314,46 @@ class AgentsOwlTests(unittest.TestCase):
         self.assertEqual(second, "codex")
         self.assertNotIn("native_session_id", event)
 
+    def test_new_codex_pair_does_not_adopt_rollout_owned_by_another_pair(self) -> None:
+        codex_home = self.root / "codex-home"
+        old_root = initialize_pair(self.repo, self.state, "old")
+        (old_root / "native-sessions.json").write_text(
+            json.dumps(
+                {"peer": {"provider": "codex", "native_session_id": "thread-old"}},
+            ),
+            encoding="utf-8",
+        )
+        rollout = codex_home / "sessions" / "2026" / "01" / "rollout-thread-old.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            json.dumps({"payload": {"session_id": "thread-old", "cwd": str(self.repo)}})
+            + "\n{}\n",
+            encoding="utf-8",
+        )
+        new_root = initialize_pair(self.repo, self.state, "new")
+        (new_root / "native-sessions.json").write_text(
+            json.dumps(
+                {"peer": {"provider": "codex", "native_session_id": "thread-old"}},
+            ),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            repo=str(self.repo), state_home=str(self.state), pair="new", role="peer",
+            command=None, fresh=False, recent_context=False,
+        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+            "agents_owl.cli.launch_runtime"
+        ) as launch:
+            command_session(args)
+        startup = launch.call_args.args[2][-1]
+        event = json.loads(
+            (self.state / "pairs" / "new" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()[-1]
+        )
+        self.assertEqual(startup.split("; exec ", 1)[1], "codex")
+        self.assertNotIn("native_session_id", event)
+
     def test_custom_pair_command_is_not_rewritten(self) -> None:
         for command in ("my-agent --flag", "claude --resume abc", "codex exec 'hi'"):
             with self.subTest(command=command):
@@ -386,7 +426,7 @@ class AgentsOwlTests(unittest.TestCase):
         self.assertEqual(list((root / "artifacts").iterdir()), [])
         inject.assert_not_called()
 
-    def test_send_peer_rejects_stale_native_worker_handoff(self) -> None:
+    def test_send_peer_allows_existing_worker_handoff_after_newer_worker_turn(self) -> None:
         root = initialize_pair(self.repo, self.state, "demo")
         native_id = "worker-claude-session"
         (root / "native-sessions.json").write_text(
@@ -417,13 +457,11 @@ class AgentsOwlTests(unittest.TestCase):
         ])
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_home)}), patch(
             "agents_owl.cli.require_runtime_target"
-        ), patch("agents_owl.cli.inject_prompt") as inject, self.assertRaisesRegex(
-            SystemExit, "stale worker handoff"
-        ):
+        ), patch("agents_owl.cli.inject_prompt") as inject:
             args.func(args)
-        self.assertTrue(handoff.is_file())
-        self.assertEqual(list((root / "artifacts").iterdir()), [])
-        inject.assert_not_called()
+        self.assertFalse(handoff.is_file())
+        self.assertEqual(len(list((root / "artifacts").iterdir())), 1)
+        inject.assert_called_once()
 
     def test_policy_text_uses_absolute_paths_and_note(self) -> None:
         metadata = {"policy_files": ["AGENTS.md"], "collaboration_note": "Human decides."}
