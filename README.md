@@ -55,6 +55,7 @@ ff impl             # 新建 Claude worker，交互输入 topic
 ff review           # 新建 Codex peer，交互输入 topic
 ff impl 'topic'     # 也可直接给 topic
 ff review 'topic'
+ff impl 'topic' --codex-worker  # 改用 Codex worker；同 topic 的 review 自动使用 Claude
 ff solo claude     # 当前目录的独立 Claude；不需要 pair/topic
 ff solo codex      # 当前目录的独立 Codex
 ```
@@ -130,6 +131,10 @@ agents-owl r                          # 选择该 pair 的 peer
 agents-owl status                     # 不写名称时，编号选择当前项目的 pair
 ```
 
+新 pair 若需要 Codex worker / Claude peer，先执行
+`agents-owl init my-project --codex-worker`，之后仍用同一组 `session`、`i/r`、
+`send-peer/send-back` 命令。现有 pair 不会因省略开关而改变组合。
+
 worker 完成后写入 `agents-owl status my-project` 显示的
 `inbox/worker-handoff.md`，然后协调端执行：
 
@@ -171,8 +176,8 @@ agents-owl decision my-project skip-peer --note 'Low-risk local change; project 
 
 ```text
 agents-owl sessions [--all] [--provider codex|claude] [--role worker|peer] [--json]
-agents-owl impl [TOPIC] [--name NAME]
-agents-owl review [TOPIC] [--name NAME]
+agents-owl impl [TOPIC] [--name NAME] [--codex-worker]
+agents-owl review [TOPIC] [--name NAME] [--codex-worker]
 agents-owl i [--all] [--provider codex|claude] [--json]
 agents-owl r [--all] [--provider codex|claude] [--json]
 agents-owl session new --provider PROVIDER --role ROLE --topic TOPIC [--name NAME]
@@ -185,10 +190,10 @@ agents-owl session archive [SESSION]
 agents-owl session unarchive [SESSION]
 agents-owl hook install-claude
 
-agents-owl init PAIR
 agents-owl solo claude|codex [--name NAME]
 agents-owl status [PAIR]
-agents-owl session PAIR worker|peer
+agents-owl init PAIR [--codex-worker]
+agents-owl session PAIR worker|peer [--codex-worker]
 agents-owl send-peer PAIR [--focus 'Review questions and requirements']
 agents-owl send-back PAIR
 agents-owl archive-worker PAIR

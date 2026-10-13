@@ -20,7 +20,9 @@ from agents_owl.cli import (
     initialized_pairs,
     latest_artifacts,
     normalize_argv,
+    pair_native_session_id,
     pair_runtime_socket,
+    pair_runtime_records,
     policy_text,
     project_config,
     queue_codex_prompt,
@@ -28,6 +30,7 @@ from agents_owl.cli import (
     read_json_object,
     validate_pair,
 )
+from agents_owl.registry import SessionRecord, SessionRegistry
 
 
 class AgentsOwlTests(unittest.TestCase):
@@ -64,8 +67,61 @@ class AgentsOwlTests(unittest.TestCase):
         root = initialize_pair(self.repo, self.state, "demo")
         metadata = json.loads((root / "pair.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["repo"], str(self.repo))
+        self.assertEqual(metadata["worker_provider"], "claude")
         self.assertEqual(metadata["policy_files"], ["AGENTS.md"])
         self.assertIn("not project governance authority", (root / "decisions.md").read_text(encoding="utf-8"))
+
+    def test_pair_mode_persists_and_drives_both_roles(self) -> None:
+        args = build_parser().parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state),
+            "init", "reverse", "--codex-worker",
+        ])
+        args.func(args)
+        root = initialize_pair(self.repo, self.state, "reverse")
+        metadata = json.loads((root / "pair.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["worker_provider"], "codex")
+        records = pair_runtime_records(self.state, repo=self.repo, provider=None, role=None)
+        self.assertEqual({record.role: record.provider for record in records}, {
+            "worker": "codex", "peer": "claude",
+        })
+        with self.assertRaisesRegex(SystemExit, "already uses codex worker"):
+            initialize_pair(self.repo, self.state, "reverse", worker_provider="claude")
+
+    def test_reverse_pair_launches_codex_worker_and_claude_peer(self) -> None:
+        initialize_pair(self.repo, self.state, "demo", worker_provider="codex")
+        codex_home = self.root / "codex-home"
+        claude_home = self.root / "claude-home"
+        with patch.dict(os.environ, {
+            "CODEX_HOME": str(codex_home), "CLAUDE_CONFIG_DIR": str(claude_home),
+        }, clear=False), patch.dict(os.environ, {
+            "AGENTS_OWL_WORKER_CMD": "", "AGENTS_OWL_PEER_CMD": "",
+            "IMPLEMENTER_CMD": "", "REVIEWER_CMD": "",
+        }, clear=False):
+            worker, _ = self.pair_session("worker")
+            peer, event = self.pair_session("peer")
+        self.assertEqual(worker, "codex")
+        self.assertTrue(peer.startswith("claude --session-id "))
+        self.assertEqual(event["role"], "peer")
+
+    def test_short_commands_infer_reverse_mode_from_same_topic(self) -> None:
+        parser = build_parser()
+        worker = parser.parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state),
+            "impl", "research", "--codex-worker",
+        ])
+        with patch("agents_owl.cli.SessionManager.new") as start:
+            worker.func(worker)
+        self.assertEqual(start.call_args.kwargs["provider"], "codex")
+        SessionRegistry(self.state).upsert(SessionRecord(
+            provider="codex", native_session_id="thread-1", native_name="research [worker]",
+            topic="research", role="worker", repo=str(self.repo),
+        ))
+        peer = parser.parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state), "review", "research",
+        ])
+        with patch("agents_owl.cli.SessionManager.new") as start:
+            peer.func(peer)
+        self.assertEqual(start.call_args.kwargs["provider"], "claude")
 
     def test_initialized_pairs_are_filtered_by_repository(self) -> None:
         other_repo = self.root / "other-repo"
@@ -130,6 +186,24 @@ class AgentsOwlTests(unittest.TestCase):
         ), patch("agents_owl.cli.attach_runtime") as attach:
             command_sessions(args)
 
+        attach.assert_called_once_with(expected_socket)
+
+    def test_reverse_peer_selector_attaches_claude_without_codex_replay(self) -> None:
+        initialize_pair(self.repo, self.state, "reverse", worker_provider="codex")
+        args = argparse.Namespace(
+            repo=str(self.repo), state_home=str(self.state), global_scope=False,
+            provider="claude", role="peer", all=False, json=False, no_select=False,
+        )
+        expected_socket = str(pair_runtime_socket(self.state, self.repo, "reverse", "peer"))
+        with patch("agents_owl.cli.sys.stdin.isatty", return_value=True), patch(
+            "agents_owl.cli.sys.stdout.isatty", return_value=True
+        ), patch("builtins.input", return_value="1"), patch(
+            "agents_owl.cli.runtime_state", return_value="running"
+        ), patch("agents_owl.cli.codex_rollout_is_idle") as idle, patch(
+            "agents_owl.cli.attach_runtime"
+        ) as attach:
+            command_sessions(args)
+        idle.assert_not_called()
         attach.assert_called_once_with(expected_socket)
 
     def test_idle_peer_restarts_same_codex_session_to_replay_history(self) -> None:
@@ -297,6 +371,45 @@ class AgentsOwlTests(unittest.TestCase):
         self.assertEqual(resumed_event["native_session_id"], "thread-1")
         self.assertTrue(resumed_event["resumed"])
 
+    def test_new_codex_worker_ignores_existing_unbound_rollout_in_same_repo(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions" / "2026" / "01"
+        rollout_dir.mkdir(parents=True)
+        old = rollout_dir / "rollout-old.jsonl"
+        old.write_text(
+            json.dumps({"payload": {"session_id": "old", "cwd": str(self.repo)}}) + "\n{}\n",
+            encoding="utf-8",
+        )
+        initialize_pair(self.repo, self.state, "demo", worker_provider="codex")
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            first, _ = self.pair_session("worker")
+            new = rollout_dir / "rollout-new.jsonl"
+            new.write_text(
+                json.dumps({"payload": {"session_id": "new", "cwd": str(self.repo)}}) + "\n{}\n",
+                encoding="utf-8",
+            )
+            second, event = self.pair_session("worker")
+        self.assertEqual(first, "codex")
+        self.assertEqual(second, "codex resume new")
+        self.assertEqual(event["native_session_id"], "new")
+
+    def test_codex_pair_binds_its_new_rollout_while_runtime_is_live(self) -> None:
+        codex_home = self.root / "codex-home"
+        initialize_pair(self.repo, self.state, "demo", worker_provider="codex")
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            self.pair_session("worker")
+            rollout = codex_home / "sessions" / "2026" / "01" / "rollout-new.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps({"payload": {"session_id": "new", "cwd": str(self.repo)}}) + "\n{}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(pair_native_session_id(self.state, "demo", "worker"), "new")
+        binding = json.loads(
+            (self.state / "pairs" / "demo" / "native-sessions.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(binding["worker"]["native_session_id"], "new")
+
     def test_restarted_codex_pair_without_rollout_starts_native_cli(self) -> None:
         codex_home = self.root / "codex-home"
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
@@ -409,6 +522,42 @@ class AgentsOwlTests(unittest.TestCase):
                     self.assertIn("Use the structure in:", prompt)
                     self.assertNotIn("not mandatory headings", prompt)
                     self.assertNotIn("focus", event)
+
+    def test_reverse_pair_sends_to_claude_peer_without_codex_transport(self) -> None:
+        root = initialize_pair(self.repo, self.state, "reverse", worker_provider="codex")
+        (root / "native-sessions.json").write_text(json.dumps({
+            "peer": {"provider": "claude", "native_session_id": "claude-peer"},
+        }), encoding="utf-8")
+        (root / "inbox" / "worker-handoff.md").write_text("review material\n", encoding="utf-8")
+        args = build_parser().parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state), "send-peer", "reverse",
+        ])
+        with patch("agents_owl.cli.require_runtime_target"), patch(
+            "agents_owl.cli.wait_for_codex_runtime"
+        ) as wait, patch("agents_owl.cli.queue_codex_prompt") as queue, patch(
+            "agents_owl.cli.inject_prompt"
+        ) as inject:
+            args.func(args)
+        wait.assert_not_called()
+        queue.assert_not_called()
+        inject.assert_called_once()
+
+    def test_reverse_pair_queues_feedback_for_codex_worker(self) -> None:
+        root = initialize_pair(self.repo, self.state, "reverse", worker_provider="codex")
+        (root / "native-sessions.json").write_text(json.dumps({
+            "worker": {"provider": "codex", "native_session_id": "codex-worker"},
+        }), encoding="utf-8")
+        (root / "inbox" / "peer-response.md").write_text("feedback\n", encoding="utf-8")
+        args = build_parser().parse_args([
+            "--repo", str(self.repo), "--state-home", str(self.state), "send-back", "reverse",
+        ])
+        with patch("agents_owl.cli.require_runtime_target"), patch(
+            "agents_owl.cli.queue_codex_prompt", return_value=True
+        ) as queue, patch("agents_owl.cli.inject_prompt") as inject:
+            args.func(args)
+        queue.assert_called_once()
+        self.assertEqual(queue.call_args.args[0], "codex-worker")
+        inject.assert_not_called()
 
     def test_empty_focus_is_rejected_before_consuming_handoff(self) -> None:
         root = initialize_pair(self.repo, self.state, "demo")

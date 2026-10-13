@@ -61,6 +61,18 @@ KIND_ALIASES = {
 DECISIONS = {"accept", "revise", "reject", "fork", "skip-peer"}
 
 
+def role_provider(role: str, worker_provider: str) -> str:
+    """Resolve one of the two supported worker/peer provider combinations."""
+
+    if not isinstance(worker_provider, str) or worker_provider not in {"claude", "codex"}:
+        raise SystemExit(f"error: invalid worker provider: {worker_provider}")
+    if role not in {"worker", "peer"}:
+        raise SystemExit(f"error: invalid pair role: {role}")
+    if role == "worker":
+        return worker_provider
+    return "codex" if worker_provider == "claude" else "claude"
+
+
 @dataclass(frozen=True)
 class PairRuntimeRecord:
     """A fixed pair runtime exposed alongside indexed topic sessions."""
@@ -69,10 +81,7 @@ class PairRuntimeRecord:
     role: str
     repo: Path
     runtime_socket: str
-
-    @property
-    def provider(self) -> str:
-        return "claude" if self.role == "worker" else "codex"
+    provider: str
 
     @property
     def native_name(self) -> str:
@@ -158,9 +167,12 @@ def pair_root(state_home: Path, pair: str) -> Path:
     return state_home / "pairs" / validate_pair(pair)
 
 
-def initialize_pair(repo: Path, state_home: Path, pair: str) -> Path:
+def initialize_pair(
+    repo: Path, state_home: Path, pair: str, *, worker_provider: str | None = None
+) -> Path:
     root = pair_root(state_home, pair)
     existing_path = root / "pair.json"
+    existing: dict[str, Any] = {}
     if existing_path.is_file():
         existing = read_json_object(existing_path, "pair metadata")
         repo_value = existing.get("repo")
@@ -171,6 +183,15 @@ def initialize_pair(repo: Path, state_home: Path, pair: str) -> Path:
             raise SystemExit(
                 f"error: pair {pair!r} already belongs to {existing_repo}; choose another pair name"
             )
+    stored_provider = existing.get("worker_provider", "claude")
+    role_provider("worker", stored_provider)
+    if worker_provider is not None:
+        role_provider("worker", worker_provider)
+        if existing and stored_provider != worker_provider:
+            raise SystemExit(
+                f"error: pair {pair!r} already uses {stored_provider} worker; choose a new pair name"
+            )
+    worker_provider = worker_provider or stored_provider
     for name in ("inbox", "artifacts"):
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / "events.jsonl").touch(exist_ok=True)
@@ -187,6 +208,7 @@ def initialize_pair(repo: Path, state_home: Path, pair: str) -> Path:
         "repo": str(repo),
         "policy_files": config.get("policy_files", []),
         "collaboration_note": config.get("collaboration_note", ""),
+        "worker_provider": worker_provider,
         "updated_at": now_iso(),
     }
     existing_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -241,16 +263,25 @@ def pair_runtime_records(
     records: list[PairRuntimeRecord] = []
     roles = (role,) if role else ("worker", "peer")
     for pair, pair_repo in initialized_pairs(state_home, repo):
+        worker_provider = pair_worker_provider(state_home, pair)
         for selected_role in roles:
             record = PairRuntimeRecord(
                 pair=pair,
                 role=selected_role,
                 repo=pair_repo,
                 runtime_socket=str(pair_runtime_socket(state_home, pair_repo, pair, selected_role)),
+                provider=role_provider(selected_role, worker_provider),
             )
             if provider is None or record.provider == provider:
                 records.append(record)
     return records
+
+
+def pair_worker_provider(state_home: Path, pair: str) -> str:
+    metadata = read_json_object(pair_root(state_home, pair) / "pair.json", "pair metadata")
+    worker_provider = metadata.get("worker_provider", "claude")
+    role_provider("worker", worker_provider)
+    return worker_provider
 
 
 def choose_pair(repo: Path, state_home: Path) -> str:
@@ -344,6 +375,11 @@ def pair_runtime_socket(state_home: Path, repo: Path, pair: str, role: str) -> P
 
 
 def pair_native_session_id(state_home: Path, pair: str, role: str) -> str | None:
+    binding = pair_native_session_binding(state_home, pair, role)
+    return binding[1] if binding else None
+
+
+def pair_native_session_binding(state_home: Path, pair: str, role: str) -> tuple[str, str] | None:
     path = pair_root(state_home, pair) / "native-sessions.json"
     if not path.is_file():
         return None
@@ -351,8 +387,33 @@ def pair_native_session_id(state_home: Path, pair: str, role: str) -> str | None
     value = bindings.get(ROLE_ALIASES[role])
     if not isinstance(value, dict):
         return None
-    native_id = value.get("native_session_id")
-    return native_id if isinstance(native_id, str) and native_id else None
+    provider, native_id = value.get("provider"), value.get("native_session_id")
+    if provider not in {"claude", "codex"}:
+        return None
+    key = ROLE_ALIASES[role]
+    if isinstance(native_id, str) and native_id:
+        if native_session_owned_elsewhere(path, key, provider, native_id):
+            return None
+        return provider, native_id
+    baseline = value.get("pending_rollout_ids")
+    if provider != "codex" or not isinstance(baseline, list) or not all(
+        isinstance(item, str) for item in baseline
+    ):
+        return None
+    metadata = read_json_object(pair_root(state_home, pair) / "pair.json", "pair metadata")
+    repo_value = metadata.get("repo")
+    if not isinstance(repo_value, str):
+        return None
+    candidates = {
+        candidate for candidate in codex_rollout_ids(Path(repo_value), require_turn=True) - set(baseline)
+        if not native_session_owned_elsewhere(path, key, provider, candidate)
+    }
+    if len(candidates) != 1:
+        return None
+    native_id = candidates.pop()
+    bindings[key] = {"provider": "codex", "native_session_id": native_id, "created_at": now_iso()}
+    _atomic_json_write(path, bindings)
+    return provider, native_id
 
 
 def require_runtime_target(target: str) -> None:
@@ -530,7 +591,10 @@ def context(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def command_init(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
-    root = initialize_pair(repo, state_home, args.pair)
+    root = initialize_pair(
+        repo, state_home, args.pair,
+        worker_provider="codex" if getattr(args, "codex_worker", False) else None,
+    )
     append_event(root, args.pair, "init", repo=str(repo))
     print(f"initialized {root}")
 
@@ -542,6 +606,9 @@ def command_status(args: argparse.Namespace) -> None:
     print(f"pair: {pair}")
     print(f"repo: {repo}")
     print(f"state: {root}")
+    worker_provider = metadata.get("worker_provider", "claude")
+    print(f"worker: {role_provider('worker', worker_provider)}")
+    print(f"peer: {role_provider('peer', worker_provider)}")
     print("policy files:")
     for item in metadata.get("policy_files", []):
         print(f"  {item}")
@@ -567,14 +634,17 @@ def command_status(args: argparse.Namespace) -> None:
 
 def command_session(args: argparse.Namespace) -> None:
     repo, state_home = context(args)
-    root = initialize_pair(repo, state_home, args.pair)
+    root = initialize_pair(
+        repo, state_home, args.pair,
+        worker_provider="codex" if getattr(args, "codex_worker", False) else None,
+    )
     role = ROLE_ALIASES[args.role]
     session = session_name(args.pair, role)
     runtime_socket = pair_runtime_socket(state_home, repo, args.pair, role)
     if runtime_state(str(runtime_socket)) == "running":
         attach_runtime(str(runtime_socket))
         return
-    default_cmd = "claude" if role == "worker" else "codex"
+    default_cmd = role_provider(role, pair_worker_provider(state_home, args.pair))
     legacy_env = "IMPLEMENTER_CMD" if role == "worker" else "REVIEWER_CMD"
     owl_env = "AGENTS_OWL_WORKER_CMD" if role == "worker" else "AGENTS_OWL_PEER_CMD"
     agent_cmd = args.command or os.environ.get(owl_env) or os.environ.get(legacy_env) or default_cmd
@@ -690,54 +760,40 @@ def _codex_rollout_info(path: Path, *, require_turn: bool = False) -> tuple[str 
     return native_id, cwd if isinstance(cwd, str) else None
 
 
-def codex_latest_rollout_id(repo: Path) -> str | None:
-    """Find the newest recorded Codex session whose cwd is ``repo``."""
+def codex_rollout_ids(repo: Path, *, require_turn: bool = False) -> set[str]:
+    """Read native Codex IDs in one directory, including already open sessions."""
 
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
     sessions = codex_home / "sessions"
     if not sessions.is_dir():
-        return None
-    candidates: list[tuple[float, Path]] = []
+        return set()
+    ids: set[str] = set()
     for path in sessions.rglob("rollout-*.jsonl"):
-        try:
-            candidates.append((path.stat().st_mtime, path))
-        except OSError:
-            continue
-    for _, path in sorted(candidates, reverse=True):
-        native_id, cwd = _codex_rollout_info(path, require_turn=True)
+        native_id, cwd = _codex_rollout_info(path, require_turn=require_turn)
         if isinstance(cwd, str) and Path(cwd).expanduser().resolve() == repo.resolve():
             if isinstance(native_id, str) and native_id:
-                return native_id
-    return None
+                ids.add(native_id)
+    return ids
 
 
-def native_session_owned_elsewhere(path: Path, provider: str, native_session_id: str) -> bool:
-    """Return whether a pair binding already owns ``native_session_id``.
+def native_session_owned_elsewhere(path: Path, key: str, provider: str, native_session_id: str) -> bool:
+    """Prevent a pair or solo slot from adopting another managed conversation."""
 
-    Codex does not let the plain interactive command choose a new thread ID
-    before its first turn.  AgentsOwl therefore discovers that ID on a later
-    invocation by looking at the newest rollout in the repository.  Never
-    adopt a rollout that another pair already owns: doing so would make two
-    independent pair roles resume the same provider conversation.
-    """
-
-    pairs_dir = path.parent.parent
-    if pairs_dir.name != "pairs" or not pairs_dir.is_dir():
-        return False
-    try:
-        current = path.resolve()
-    except OSError:
-        current = path
-    for candidate in pairs_dir.glob("*/native-sessions.json"):
+    state_home = path.parent.parent.parent if path.parent.parent.name == "pairs" else path.parent.parent
+    candidate_paths = [
+        *state_home.glob("pairs/*/native-sessions.json"),
+        state_home / "solo/native-sessions.json",
+    ]
+    for candidate in candidate_paths:
         try:
-            if candidate.resolve() == current:
-                continue
             payload = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
             continue
-        for binding in payload.values():
+        for binding_key, binding in payload.items():
+            if candidate == path and binding_key == key:
+                continue
             if not isinstance(binding, dict):
                 continue
             if (
@@ -745,6 +801,20 @@ def native_session_owned_elsewhere(path: Path, provider: str, native_session_id:
                 and binding.get("native_session_id") == native_session_id
             ):
                 return True
+    registry_path = state_home / "sessions/index.json"
+    if registry_path.is_file():
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            registry = {}
+        records = registry.get("sessions", []) if isinstance(registry, dict) else []
+        if isinstance(records, list) and any(
+            isinstance(record, dict)
+            and record.get("provider") == provider
+            and record.get("native_session_id") == native_session_id
+            for record in records
+        ):
+            return True
     return False
 
 
@@ -871,7 +941,7 @@ def native_session_args(
     if not fresh and isinstance(stored, dict) and stored.get("provider") == provider:
         value = stored.get("native_session_id")
         native_id = value if isinstance(value, str) and value else None
-    if native_id and native_session_owned_elsewhere(path, provider, native_id):
+    if native_id and native_session_owned_elsewhere(path, key, provider, native_id):
         native_id = None
     if provider == "claude":
         resumed = native_id is not None and claude_transcript_exists(native_id)
@@ -879,19 +949,49 @@ def native_session_args(
         extra = ["--resume", native_id] if resumed else ["--session-id", native_id, "--name", native_name]
     else:
         resumed = native_id is not None and codex_rollout_exists(native_id)
-        if not fresh and not resumed:
-            candidate = codex_latest_rollout_id(repo)
-            if candidate and not native_session_owned_elsewhere(path, provider, candidate):
-                native_id = candidate
-                resumed = True
+        if not resumed:
+            native_id = None
+            baseline = stored.get("pending_rollout_ids") if isinstance(stored, dict) else None
+            valid_baseline = isinstance(baseline, list) and all(isinstance(item, str) for item in baseline)
+            if (
+                not fresh and isinstance(stored, dict) and stored.get("provider") == "codex"
+                and valid_baseline
+            ):
+                candidates = {
+                    candidate for candidate in codex_rollout_ids(repo, require_turn=True) - set(baseline)
+                    if not native_session_owned_elsewhere(path, key, provider, candidate)
+                }
+                if len(candidates) > 1:
+                    raise SessionManagerError(
+                        "multiple new Codex rollouts appeared since this session started; "
+                        "cannot safely choose one to resume"
+                    )
+                if candidates:
+                    native_id = candidates.pop()
+                    resumed = True
+            if not resumed and (
+                fresh or not valid_baseline or stored.get("provider") != "codex"
+            ):
+                # Snapshot IDs before the first native TUI starts. An existing
+                # session in this repository is never a candidate for this slot.
+                sessions[key] = {
+                    "provider": "codex",
+                    "pending_rollout_ids": sorted(codex_rollout_ids(repo)),
+                    "created_at": now_iso(),
+                }
+                _atomic_json_write(path, sessions)
         # A brand-new Codex TUI must create its own rollout. An app-server
         # thread/start ID cannot be resumed until it has a first turn.
         extra = ["resume", native_id] if resumed else []
     if native_id is None:
-        if key in sessions:
+        if provider != "codex" and key in sessions:
             sessions.pop(key)
             _atomic_json_write(path, sessions)
-    elif not isinstance(stored, dict) or stored.get("native_session_id") != native_id:
+    elif (
+        not isinstance(stored, dict)
+        or stored.get("native_session_id") != native_id
+        or stored.get("provider") != provider
+    ):
         sessions[key] = {"provider": provider, "native_session_id": native_id, "created_at": now_iso()}
         _atomic_json_write(path, sessions)
     return extra, native_id, resumed
@@ -944,8 +1044,9 @@ def command_send_peer(args: argparse.Namespace) -> None:
     root, metadata = require_pair(repo, state_home, args.pair)
     target = args.target or str(pair_runtime_socket(state_home, repo, args.pair, "peer"))
     require_runtime_target(target)
-    native_id = pair_native_session_id(state_home, args.pair, "peer")
-    if native_id and not wait_for_codex_runtime(target, native_id):
+    binding = pair_native_session_binding(state_home, args.pair, "peer")
+    codex_id = binding[1] if binding and binding[0] == "codex" else None
+    if codex_id and not wait_for_codex_runtime(target, codex_id):
         raise SystemExit("error: peer Codex runtime is still starting; handoff was not archived")
     handoff = root / "inbox" / "worker-handoff.md"
     if not handoff.is_file():
@@ -979,7 +1080,7 @@ def command_send_peer(args: argparse.Namespace) -> None:
             if focus else "Use the structure in:"
         ),
     )
-    if not native_id or not queue_codex_prompt(native_id, prompt):
+    if not codex_id or not queue_codex_prompt(codex_id, prompt):
         inject_prompt(target, prompt)
     append_event(
         root, args.pair, "send-peer", artifact=str(artifact), target=target,
@@ -1003,7 +1104,10 @@ def command_send_back(args: argparse.Namespace) -> None:
         worker_template_path=str(template_path("worker-handoff.md")),
         policy_files=policy_text(repo, metadata),
     )
-    inject_prompt(target, prompt)
+    binding = pair_native_session_binding(state_home, args.pair, "worker")
+    codex_id = binding[1] if binding and binding[0] == "codex" else None
+    if not codex_id or not queue_codex_prompt(codex_id, prompt):
+        inject_prompt(target, prompt)
     append_event(root, args.pair, "send-back", artifact=str(artifact), target=target)
     print(f"sent peer feedback to {target}")
     print(f"archived peer response: {artifact}")
@@ -1288,11 +1392,32 @@ def required_or_prompt(value: str | None, label: str) -> str:
     raise SessionManagerError(f"{label.lower()} is required")
 
 
+def topic_worker_provider(manager: SessionManager, topic: str, *, codex_worker: bool) -> str:
+    """Keep short-command sessions with the same topic in one provider mode."""
+
+    modes = {
+        record.provider if record.role == "worker" else role_provider("peer", record.provider)
+        for record in manager.registry.find(repo=manager.repo, include_archived=True)
+        if record.topic == topic
+    }
+    if len(modes) > 1:
+        raise SessionManagerError(f"topic {topic!r} has conflicting provider combinations")
+    if codex_worker and modes and modes != {"codex"}:
+        raise SessionManagerError(f"topic {topic!r} already uses a Claude worker")
+    return "codex" if codex_worker else next(iter(modes), "claude")
+
+
 def command_session_new(args: argparse.Namespace) -> None:
     manager = session_manager(args)
-    provider = required_or_prompt(args.provider, "Provider (codex/claude)")
     topic = required_or_prompt(args.topic, "Topic")
     role = required_or_prompt(args.role, "Role (worker/peer)")
+    if args.command_name in {"impl", "review"}:
+        mode = topic_worker_provider(
+            manager, topic, codex_worker=getattr(args, "codex_worker", False)
+        )
+        provider = role_provider(role, mode)
+    else:
+        provider = required_or_prompt(args.provider, "Provider (codex/claude)")
     print(f"starting protected {provider} {role} session", flush=True)
     manager.new(
         provider=provider,
@@ -1390,14 +1515,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     solo.set_defaults(func=command_solo)
 
-    impl = sub.add_parser("impl", help="start a Claude worker session")
+    impl = sub.add_parser("impl", help="start a worker session (Claude by default)")
     impl.add_argument("topic", nargs="?")
     impl.add_argument("--name", help="provider-native session name")
+    impl.add_argument("--codex-worker", action="store_true", help="use Codex worker and Claude peer for this topic")
     impl.set_defaults(func=command_session_new, provider="claude", role="worker")
 
-    review = sub.add_parser("review", help="start a Codex peer session")
+    review = sub.add_parser("review", help="start a peer session (Codex by default)")
     review.add_argument("topic", nargs="?")
     review.add_argument("--name", help="provider-native session name")
+    review.add_argument("--codex-worker", action="store_true", help="use Codex worker and Claude peer for this topic")
     review.set_defaults(func=command_session_new, provider="codex", role="peer")
 
     workers = sub.add_parser("i", help="list and select worker sessions")
@@ -1410,6 +1537,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="initialize or refresh a pair")
     init.add_argument("pair")
+    init.add_argument("--codex-worker", action="store_true", help="use Codex worker and Claude peer")
     init.set_defaults(func=command_init)
 
     status = sub.add_parser("status", help="show pair state without creating it")
@@ -1467,6 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     legacy_session.add_argument("pair")
     legacy_session.add_argument("role", choices=sorted(ROLE_ALIASES))
+    legacy_session.add_argument("--codex-worker", action="store_true", help="use Codex worker and Claude peer for a new pair")
     legacy_session.add_argument("--command", help="agent command; defaults to claude for worker and codex for peer")
     legacy_session.add_argument(
         "--fresh",

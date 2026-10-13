@@ -41,8 +41,9 @@ sudo apt install dtach
 
 如果可执行文件不叫 `dtach`，可以设置 `AGENTS_OWL_DTACH_CMD`。
 
-Codex 无需额外配置。首次启动直接运行原生 `codex`；已有 rollout 时，AgentsOwl
-在受保护 PTY 中执行 `codex resume <native-id>`。app-server 只用于会话元数据管理。
+Codex 无需额外配置。首次启动直接运行原生 `codex`；当该会话产生了可识别的
+rollout 后，AgentsOwl 在受保护 PTY 中执行 `codex resume <native-id>`。
+app-server 只用于 topic 会话元数据管理。
 
 Claude 需要一次性安装 `SessionStart`/`SessionEnd` hooks：
 
@@ -64,7 +65,15 @@ ff i               # worker 列表；同时显示固定 pair，选择后进入
 ff r               # peer 列表；同时显示固定 pair，选择后进入
 ff impl [TOPIC]    # 新建 Claude worker
 ff review [TOPIC]  # 新建 Codex peer
+ff impl TOPIC --codex-worker  # 新建 Codex worker；同 topic 的 review 使用 Claude
 ```
+
+只有两种角色组合：默认是 Claude worker / Codex peer；指定 `--codex-worker`
+后是 Codex worker / Claude peer。`ff review TOPIC` 会从同 topic 已有会话
+推断组合；如果先创建 peer，可运行 `ff review TOPIC --codex-worker`。
+用于 `send-peer` 的固定 pair 则用 `ff init PAIR --codex-worker` 一次性选择组合，
+后续 `ff session PAIR worker|peer`、`ff i/r`、`send-peer/send-back` 不必重复指定。
+已有 pair 的组合保持不变，切换组合请创建新 pair。
 
 这些只是 AgentsOwl 内置子命令的短入口，不是 shell 中五套独立逻辑。
 
@@ -79,13 +88,16 @@ rollout ID 重启；这不会创建新会话。恢复界面默认预览最近约
 回复可见，同时保留完整原生上下文。需要查看全部 transcript 时仍可按 `Ctrl+T`，按
 `q` 返回输入界面。若任务仍在执行，则不会重启，只 attach 到现有 runtime。
 对正在运行的 Codex，`ff r` 不会自动发送 `Ctrl+T`，因此会直接回到当前主界面。
+反向组合中的 Codex worker 在 `ff i` 下使用相同的 Codex 恢复逻辑；Claude peer
+在 `ff r` 下按 Claude 原生会话恢复。
 
 - Claude：首次启动用 `--session-id` 固定 ID，之后用 `claude --resume <id>`；
   如果上次没有产生任何对话（无 transcript），沿用同一 ID 重新开始。
 - Codex：首次启动直接运行原生 `codex`，让 Codex 自己创建可恢复的 rollout；之后
   使用该 rollout 的 ID 执行 `codex resume <id>`。如果刚启动后立即退出、尚未产生
-  rollout，下次仍直接启动新的原生 TUI。自动发现 rollout 时，如果候选 ID 已经
-  绑定到其他 pair，会拒绝复用并启动新的原生 TUI，避免两个 pair 共享同一段上下文。
+  rollout，下次仍直接启动新的原生 TUI。首次启动时会记录该目录已有的 rollout；
+  之后只会绑定新增且唯一的 rollout，不会按目录最新会话盲目恢复。若出现多个
+  候选，命令会报错，避免把其他会话的上下文接入当前角色。
 
 绑定关系保存在 `pairs/<PAIR>/native-sessions.json`。需要为某个角色开启全新
 对话时：

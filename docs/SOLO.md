@@ -51,8 +51,9 @@ solo 会话通过 `ff solo ...` 接回，不出现在 worker/peer 的 `ff i/r` �
 - 启动时移除继承的 `AGENTS_OWL_*` 协作变量与旧 worker/peer 命令变量，避免误登记为 managed session。
 - 正常保留 provider 的全局设置、认证环境及适用于当前目录的项目规则。solo 不是配置隔离或文件访问沙箱。
 - runtime socket 位于 AgentsOwl state 目录，默认是 `~/.local/state/agents-owl/runtimes/`，不在任务目录生成额外文件。
-- Codex 首次启动由原生 TUI 创建 rollout；产生 rollout 后，“目录 + provider + 名称”
-  与原生会话 ID 的绑定保存在 `~/.local/state/agents-owl/solo/native-sessions.json`。
+- Codex 首次启动由原生 TUI 创建 rollout；工具会记录首次启动前该目录已有的
+  rollout，只将之后新增且唯一的会话绑定到“目录 + provider + 名称”。绑定保存在
+  `~/.local/state/agents-owl/solo/native-sessions.json`。
 
 `ff` 的 alias 应直接指向工具，不要带固定项目的 `cd`：
 

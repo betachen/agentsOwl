@@ -14,6 +14,15 @@
 ff init range-v01-r2
 ```
 
+若要 Codex 实现、Claude 复核，在初始化时加一个开关：
+
+```bash
+ff init range-v01-r2 --codex-worker
+```
+
+之后启动、恢复和交接命令不变；该 pair 的两个角色会自动使用对应客户端。
+已有 pair 的模式不会被重新初始化覆盖，切换组合请使用新 pair 名。
+
 Worker 终端：
 
 ```bash
