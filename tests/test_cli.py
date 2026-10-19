@@ -326,6 +326,27 @@ class AgentsOwlTests(unittest.TestCase):
         event = json.loads((root / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
         return startup.split("; exec ", 1)[1], event
 
+    def test_fixed_pair_exports_context_for_the_shared_skill(self) -> None:
+        for role, output in (("worker", "worker-handoff.md"), ("peer", "peer-response.md")):
+            with self.subTest(role=role):
+                args = build_parser().parse_args(normalize_argv([
+                    "--repo", str(self.repo), "--state-home", str(self.state),
+                    "session", "demo", role, "--command", "custom-agent",
+                ]))
+                with patch("agents_owl.cli.launch_runtime") as launch:
+                    args.func(args)
+                environment = launch.call_args.args[3]
+                self.assertEqual(environment["AGENTS_OWL_PAIR"], "demo")
+                self.assertEqual(environment["AGENTS_OWL_ROLE"], role)
+                self.assertEqual(environment["AGENTS_OWL_REPO"], str(self.repo))
+                self.assertEqual(environment["AGENTS_OWL_STATE_HOME"], str(self.state))
+                self.assertEqual(
+                    environment["AGENTS_OWL_DELIVERABLE"],
+                    str(self.state / "pairs/demo/inbox" / output),
+                )
+                self.assertTrue((Path(environment["AGENTS_OWL_TOOL_ROOT"]) / "bin/agents-owl").is_file())
+                self.assertNotIn("AGENTS_OWL_MANAGED_SESSION", environment)
+
     def test_restarted_claude_pair_resumes_the_same_native_session(self) -> None:
         claude_home = self.root / "claude-home"
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_home)}):

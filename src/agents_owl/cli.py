@@ -682,7 +682,15 @@ def command_session(args: argparse.Namespace) -> None:
     if native_id:
         event.update(native_session_id=native_id, resumed=resumed)
     append_event(root, args.pair, "session-start", **event)
-    launch_runtime(runtime_socket, repo, ["/bin/sh", "-lc", startup], {})
+    launch_runtime(runtime_socket, repo, ["/bin/sh", "-lc", startup], {
+        "AGENTS_OWL_PAIR": args.pair,
+        "AGENTS_OWL_ROLE": role,
+        "AGENTS_OWL_REPO": str(repo),
+        "AGENTS_OWL_STATE_HOME": str(state_home),
+        "AGENTS_OWL_RUNTIME_SOCKET": str(runtime_socket),
+        "AGENTS_OWL_TOOL_ROOT": str(template_path(output_name).parent.parent),
+        "AGENTS_OWL_DELIVERABLE": str(output_path),
+    })
 
 
 CLAUDE_SESSION_FLAGS = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session"}

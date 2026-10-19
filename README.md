@@ -30,6 +30,9 @@ AgentsOwl 是一个 disconnect-safe 的 Codex/Claude Code 会话入口，也保�
 
 工具只使用 Python 标准库。
 
+Claude/Codex 可安装共享的 AgentsOwl skill，复用 pair 分工、交接和发送流程：
+运行 `python3 scripts/install_skills.py`。用法见 [skill 安装与使用](docs/SKILLS.md)。
+
 ## 快速开始
 
 ```bash
